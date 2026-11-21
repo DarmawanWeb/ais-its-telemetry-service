@@ -1,0 +1,1541 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/api/v2/telemetry/methodology": {
+      "get": {
+        "operationId": "MethodologyController_describe",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MethodologyDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Methods implemented by this service, with their sources",
+        "tags": [
+          "methodology"
+        ]
+      }
+    },
+    "/api/v2/telemetry/devices": {
+      "post": {
+        "operationId": "DevicesController_create",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeviceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Register a device on a vessel of the organization",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      },
+      "get": {
+        "operationId": "DevicesController_list",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "mmsi",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "example": 525005223,
+              "type": "number"
+            }
+          },
+          {
+            "name": "kind",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "mqtt",
+                "http"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "inactive"
+              ]
+            }
+          },
+          {
+            "name": "search",
+            "required": false,
+            "in": "query",
+            "description": "Case-insensitive substring of the name or the serial number",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "orgId",
+            "required": false,
+            "in": "query",
+            "description": "Organization (platform administrators; others: their own)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DeviceDto"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/PageMetaDto"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "List devices by vessel and name",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      }
+    },
+    "/api/v2/telemetry/devices/{id}": {
+      "get": {
+        "operationId": "DevicesController_get",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get a device",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      },
+      "patch": {
+        "description": "Inactive devices are rejected on every ingestion path. http devices need an apiKeyId, mqtt devices none.",
+        "operationId": "DevicesController_update",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDeviceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Rename, (de)activate, move or re-key a device",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      },
+      "delete": {
+        "operationId": "DevicesController_remove",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Delete a device (its readings are kept)",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      }
+    },
+    "/api/v2/telemetry/readings": {
+      "post": {
+        "description": "All or nothing: every reading is validated (non-negative, ≤ configured maxima, time ≤ now + TELEMETRY_MAX_FUTURE_SKEW_MIN, periodStart before time) and every vessel must belong to the caller’s organization before anything is stored. Readings are idempotent by (mmsi, time): repeats are counted as duplicates. Stored readings are published as fuel.reading.recorded.v1 after the commit (Nats-Msg-Id <mmsi>:<time>). Error fields are `<index>.<field>`.",
+        "operationId": "ReadingsController_ingest",
+        "parameters": [
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Signed-in users only: `manual` entries or an `import` of historical data. API keys are attributed automatically (`device` for the key of a registered http device, else `api`).",
+            "schema": {
+              "default": "manual",
+              "type": "string",
+              "enum": [
+                "manual",
+                "import"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/FuelReadingInputDto"
+                  },
+                  {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1000,
+                    "items": {
+                      "$ref": "#/components/schemas/FuelReadingInputDto"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResultDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "summary": "Ingest fuel readings (one object or an array of ≤ 1000)",
+        "tags": [
+          "readings"
+        ],
+        "x-api-key-scopes": [
+          "telemetry:ingest"
+        ],
+        "x-required-permissions": [
+          "telemetry:write"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels": {
+      "get": {
+        "description": "Newest reading, active flag and number of devices per vessel, by MMSI.",
+        "operationId": "ReadingsController_vessels",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TelemetryVesselDto"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/PageMetaDto"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Vessels of the organization with their telemetry status",
+        "tags": [
+          "readings"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels/{mmsi}/readings": {
+      "get": {
+        "description": "Ascending in time; `[from, to)`; buckets whose start lies in the range.",
+        "operationId": "ReadingsController_series",
+        "parameters": [
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "9-digit MMSI",
+            "schema": {
+              "example": 525005223,
+              "type": "number"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from `page.nextCursor` of the previous page",
+            "schema": {
+              "maxLength": 1024,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Start (ISO-8601); default: endpoint specific",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "End (ISO-8601); default: now",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "bucket",
+            "required": false,
+            "in": "query",
+            "description": "`raw` readings (default range 24 h, at most 31 d), `1h` hourly sums (7 d, ≤ 366 d) or `1d` daily sums (365 d, ≤ 5 y); buckets are UTC and come from the continuous aggregates fuel_hourly / fuel_daily",
+            "schema": {
+              "default": "raw",
+              "type": "string",
+              "enum": [
+                "raw",
+                "1h",
+                "1d"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the time-ordered list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "page"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/FuelSeriesPointDto"
+                      }
+                    },
+                    "page": {
+                      "$ref": "#/components/schemas/CursorPageInfoDto"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Readings of a vessel, raw or as hourly / daily sums",
+        "tags": [
+          "readings"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels/{mmsi}/summary": {
+      "get": {
+        "description": "Readings with time in `[from, to)` (default: the last 30 days, at most 5 years).",
+        "operationId": "ReadingsController_summary",
+        "parameters": [
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "9-digit MMSI",
+            "schema": {
+              "example": 525005223,
+              "type": "number"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Start (ISO-8601); default: endpoint specific",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "End (ISO-8601); default: now",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FuelSummaryDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Fuel totals of a vessel over a time range",
+        "tags": [
+          "readings"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels/{mmsi}/status": {
+      "get": {
+        "description": "Active = newest reading at most TELEMETRY_ACTIVE_WINDOW_MIN minutes old.",
+        "operationId": "ReadingsController_status",
+        "parameters": [
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "9-digit MMSI",
+            "schema": {
+              "example": 525005223,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatusDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Whether telemetry of a vessel is active, with its newest reading",
+        "tags": [
+          "readings"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "AIS Maritime Intelligence — AIS ITS Telemetry Service",
+    "description": "Fuel consumption telemetry: readings ingest over REST and MQTT, device registry, queries and status; publishes fuel.reading.recorded.v1",
+    "version": "0.1.0",
+    "contact": {}
+  },
+  "tags": [
+    {
+      "name": "readings",
+      "description": "Fuel readings: ingestion (API keys `telemetry:ingest`, users `telemetry:write`), series, summaries and status"
+    },
+    {
+      "name": "devices",
+      "description": "Device registry of an organization (`device:manage`)"
+    },
+    {
+      "name": "methodology",
+      "description": "Methods of the methodology catalog implemented here"
+    }
+  ],
+  "servers": [],
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "type": "http",
+        "description": "Access token (EdDSA JWT)"
+      },
+      "apiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "API key sk_<id>_<secret>"
+      },
+      "internalToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Internal-Token",
+        "description": "Service-to-service token"
+      }
+    },
+    "schemas": {
+      "LocalizedTextDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bahasa Indonesia"
+          },
+          "en": {
+            "type": "string",
+            "description": "English"
+          }
+        },
+        "required": [
+          "id",
+          "en"
+        ]
+      },
+      "MethodReferenceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "imo-mepc-352-78"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true,
+            "format": "uri"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "url"
+        ]
+      },
+      "MethodSummaryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "cii.attained"
+          },
+          "catalogued": {
+            "type": "boolean",
+            "description": "Whether the catalog shipped with @darmawanweb/ais-its-contracts describes the method"
+          },
+          "domain": {
+            "type": "string",
+            "enum": [
+              "ais",
+              "emission",
+              "seemp",
+              "telemetry",
+              "geo",
+              "safety",
+              "surveillance"
+            ],
+            "nullable": true
+          },
+          "name": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LocalizedTextDto"
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "implemented",
+              "planned",
+              "deprecated"
+            ],
+            "nullable": true
+          },
+          "needsCitation": {
+            "type": "boolean",
+            "description": "Values come from the thesis without a verified external source"
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodReferenceDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "catalogued",
+          "domain",
+          "name",
+          "status",
+          "needsCitation",
+          "references"
+        ]
+      },
+      "MethodologyDto": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "type": "string",
+            "example": "telemetry"
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodSummaryDto"
+            }
+          }
+        },
+        "required": [
+          "service",
+          "methods"
+        ]
+      },
+      "CreateDeviceDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "description": "MMSI of the vessel the device is installed on (its organization owns the device)",
+            "example": 525005223,
+            "minimum": 100000000,
+            "maximum": 999999999
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique within the organization",
+            "minLength": 1,
+            "maxLength": 120,
+            "example": "ME flow meter"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mqtt",
+              "http"
+            ],
+            "description": "`mqtt`: publishes to MQTT topic `aisits/telemetry/<id>`; `http`: posts readings with its API key"
+          },
+          "apiKeyId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Id of the API key (scope `telemetry:ingest`) of an http device; required for http, refused for mqtt"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "default": "active"
+          },
+          "serialNumber": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "example": "FM-2041-0007"
+          }
+        },
+        "required": [
+          "mmsi",
+          "name",
+          "kind"
+        ]
+      },
+      "DeviceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orgId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Organization of the vessel"
+          },
+          "mmsi": {
+            "type": "number",
+            "example": 525005223,
+            "description": "Vessel the device is installed on"
+          },
+          "name": {
+            "type": "string",
+            "example": "ME flow meter"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mqtt",
+              "http"
+            ]
+          },
+          "apiKeyId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "API key of an http device; its readings are attributed to the device"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "example": "FM-2041-0007"
+          },
+          "mqttTopic": {
+            "type": "string",
+            "nullable": true,
+            "example": "aisits/telemetry/0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77",
+            "description": "MQTT topic the device publishes to (mqtt devices)"
+          },
+          "lastSeenAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Last readings received from the device (minute resolution)"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "orgId",
+          "mmsi",
+          "name",
+          "kind",
+          "apiKeyId",
+          "status",
+          "serialNumber",
+          "mqttTopic",
+          "lastSeenAt",
+          "createdBy",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "PageMetaDto": {
+        "type": "object",
+        "properties": {
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "pageSize": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of items across all pages"
+          }
+        },
+        "required": [
+          "page",
+          "pageSize",
+          "total"
+        ]
+      },
+      "UpdateDeviceDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "description": "Move the device to another vessel of the same organization",
+            "minimum": 100000000,
+            "maximum": 999999999
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mqtt",
+              "http"
+            ]
+          },
+          "apiKeyId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "API key of an http device; `null` unlinks it (required for http devices)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "minLength": 1,
+            "maxLength": 120
+          }
+        }
+      },
+      "FuelReadingInputDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "description": "MMSI of the vessel (must belong to the organization of the caller)",
+            "example": 525005223,
+            "minimum": 100000000,
+            "maximum": 999999999
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-11-21T10:00:00Z",
+            "description": "End of the measured period, ISO-8601 UTC (millisecond precision; at most TELEMETRY_MAX_FUTURE_SKEW_MIN ahead)"
+          },
+          "periodStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "example": "2026-11-21T09:00:00Z",
+            "description": "Start of the measured period (before `time`, at most TELEMETRY_MAX_PERIOD_H earlier)"
+          },
+          "fuelMeTon": {
+            "type": "number",
+            "description": "Main-engine fuel burnt in the period, t (≥ 0, ≤ TELEMETRY_MAX_FUEL_ME_TON)",
+            "example": 0.42,
+            "minimum": 0
+          },
+          "fuelAeTon": {
+            "type": "number",
+            "description": "Auxiliary-engine fuel burnt in the period, t (≥ 0, ≤ TELEMETRY_MAX_FUEL_AE_TON)",
+            "example": 0.05,
+            "minimum": 0
+          }
+        },
+        "required": [
+          "mmsi",
+          "time",
+          "fuelMeTon",
+          "fuelAeTon"
+        ]
+      },
+      "IngestResultDto": {
+        "type": "object",
+        "properties": {
+          "received": {
+            "type": "number",
+            "description": "Readings in the request",
+            "example": 2
+          },
+          "accepted": {
+            "type": "number",
+            "description": "Readings stored by this request",
+            "example": 1
+          },
+          "duplicates": {
+            "type": "number",
+            "description": "Readings whose (mmsi, time) was stored already or repeated in the request (ignored, idempotent)",
+            "example": 1
+          },
+          "published": {
+            "type": "number",
+            "description": "Accepted readings already published to the FUEL stream; the others follow through the relay within TELEMETRY_RELAY_AFTER_S",
+            "example": 1
+          }
+        },
+        "required": [
+          "received",
+          "accepted",
+          "duplicates",
+          "published"
+        ]
+      },
+      "TelemetryVesselDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "example": 525005223
+          },
+          "vesselId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orgId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "example": "KM Sinar Bangun"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive",
+              "laid_up"
+            ],
+            "description": "Fleet status of the vessel"
+          },
+          "lastReadingAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Telemetry active (newest reading within TELEMETRY_ACTIVE_WINDOW_MIN)"
+          },
+          "devices": {
+            "type": "number",
+            "description": "Registered devices on the vessel",
+            "example": 1
+          }
+        },
+        "required": [
+          "mmsi",
+          "vesselId",
+          "orgId",
+          "name",
+          "status",
+          "lastReadingAt",
+          "active",
+          "devices"
+        ]
+      },
+      "FuelSeriesPointDto": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Reading time, or bucket start"
+          },
+          "fuelMeTon": {
+            "type": "number",
+            "description": "Main-engine fuel, t",
+            "example": 0.42
+          },
+          "fuelAeTon": {
+            "type": "number",
+            "description": "Auxiliary-engine fuel, t",
+            "example": 0.05
+          },
+          "totalFuelTon": {
+            "type": "number",
+            "description": "fuelMeTon + fuelAeTon, t",
+            "example": 0.47
+          },
+          "readings": {
+            "type": "number",
+            "description": "Readings in the point (1 for raw readings)",
+            "example": 1
+          },
+          "periodStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Start of the measured period (raw readings)"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "device",
+              "mqtt",
+              "api",
+              "manual",
+              "import"
+            ],
+            "nullable": true,
+            "description": "Raw readings only"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Raw readings only"
+          }
+        },
+        "required": [
+          "time",
+          "fuelMeTon",
+          "fuelAeTon",
+          "totalFuelTon",
+          "readings",
+          "periodStart",
+          "source",
+          "deviceId"
+        ]
+      },
+      "CursorPageInfoDto": {
+        "type": "object",
+        "properties": {
+          "nextCursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Opaque cursor of the next page; null on the last page"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500
+          }
+        },
+        "required": [
+          "nextCursor",
+          "limit"
+        ]
+      },
+      "FuelSummaryDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "example": 525005223
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the range (inclusive)"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of the range (exclusive)"
+          },
+          "readings": {
+            "type": "number",
+            "description": "Readings whose time lies in the range",
+            "example": 1440
+          },
+          "fuelMeTon": {
+            "type": "number",
+            "description": "Σ main-engine fuel, t (method telemetry.fuel_reading_usage)",
+            "example": 25.2
+          },
+          "fuelAeTon": {
+            "type": "number",
+            "description": "Σ auxiliary-engine fuel, t",
+            "example": 3.1
+          },
+          "totalFuelTon": {
+            "type": "number",
+            "description": "fuelMeTon + fuelAeTon, t",
+            "example": 28.3
+          },
+          "firstReadingAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "lastReadingAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        },
+        "required": [
+          "mmsi",
+          "from",
+          "to",
+          "readings",
+          "fuelMeTon",
+          "fuelAeTon",
+          "totalFuelTon",
+          "firstReadingAt",
+          "lastReadingAt"
+        ]
+      },
+      "FuelReadingDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "example": 525005223
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "periodStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "fuelMeTon": {
+            "type": "number",
+            "description": "Main-engine fuel, t"
+          },
+          "fuelAeTon": {
+            "type": "number",
+            "description": "Auxiliary-engine fuel, t"
+          },
+          "totalFuelTon": {
+            "type": "number",
+            "description": "fuelMeTon + fuelAeTon, t"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "device",
+              "mqtt",
+              "api",
+              "manual",
+              "import"
+            ]
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "receivedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the service stored the reading"
+          }
+        },
+        "required": [
+          "mmsi",
+          "time",
+          "periodStart",
+          "fuelMeTon",
+          "fuelAeTon",
+          "totalFuelTon",
+          "source",
+          "deviceId",
+          "receivedAt"
+        ]
+      },
+      "TelemetryStatusDto": {
+        "type": "object",
+        "properties": {
+          "mmsi": {
+            "type": "number",
+            "example": 525005223
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Newest reading at most activeWindowMin minutes old (method fuel.method_selection)"
+          },
+          "lastReadingAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Time of the newest reading"
+          },
+          "activeWindowMin": {
+            "type": "number",
+            "description": "TELEMETRY_ACTIVE_WINDOW_MIN",
+            "example": 10
+          },
+          "lastReading": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FuelReadingDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "mmsi",
+          "active",
+          "lastReadingAt",
+          "activeWindowMin",
+          "lastReading"
+        ]
+      },
+      "ProblemDetails": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Problem type URI"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "description": "Request path",
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$",
+            "description": "Stable UPPER_SNAKE_CASE error code"
+          },
+          "traceId": {
+            "type": "string"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "description": "Dot separated path, e.g. \"positions.0.lat\""
+                },
+                "message": {
+                  "type": "string"
+                },
+                "code": {
+                  "description": "Machine readable reason",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "field",
+                "message"
+              ],
+              "additionalProperties": false,
+              "description": "Field-level validation error"
+            }
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code"
+        ],
+        "additionalProperties": {},
+        "description": "RFC 9457 problem details"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ]
+}

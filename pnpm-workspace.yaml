@@ -1,0 +1,9 @@
+# pnpm settings of this single-package repository (no workspace packages).
+# Dependencies whose install scripts are not needed: native binaries come from
+# optional platform packages, the rest is telemetry or optional native addons.
+ignoredBuiltDependencies:
+  - '@scarf/scarf'
+  - '@swc/core'
+  - cpu-features
+  - protobufjs
+  - ssh2
