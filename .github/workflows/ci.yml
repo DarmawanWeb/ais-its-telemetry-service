@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       # @darmawanweb packages come from GitHub Packages; the package settings must grant
       # this repository read access ("Manage Actions access").
