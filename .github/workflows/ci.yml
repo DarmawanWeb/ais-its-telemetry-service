@@ -34,7 +34,7 @@ jobs:
       # @darmawanweb packages come from GitHub Packages; the package settings must grant
       # this repository read access ("Manage Actions access").
       - name: Setup Node.js (GitHub Packages for @darmawanweb)
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: pnpm
