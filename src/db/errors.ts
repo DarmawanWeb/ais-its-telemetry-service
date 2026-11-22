@@ -8,7 +8,7 @@ export const PG_UNIQUE_VIOLATION = '23505';
  *
  * @example
  * catch (error) {
- *   if (isUniqueViolation(error, 'notes_org_mmsi_title_key')) throw new ConflictError(…);
+ *   if (isUniqueViolation(error, 'devices_org_name_key')) throw new DeviceNameTakenError(name, error);
  *   throw error;
  * }
  */

@@ -22,6 +22,7 @@ export default defineConfig({
     name: 'unit',
     environment: 'node',
     include: ['src/**/*.spec.ts'],
+    setupFiles: ['test/support/unit-setup.ts'],
     maxWorkers: 2,
     coverage: {
       provider: 'v8',

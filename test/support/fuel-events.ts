@@ -35,7 +35,8 @@ export async function readFuelEvents(
   });
   for await (const message of messages) {
     const parsed = parseEnvelope(message.data);
-    if (!parsed.success) throw new Error(`invalid FUEL message: ${parsed.message}`);
+    if (!parsed.success)
+      throw new Error(`invalid FUEL message: ${parsed.message}`);
     events.push({
       subject: message.subject,
       msgId: message.headers?.get('Nats-Msg-Id'),

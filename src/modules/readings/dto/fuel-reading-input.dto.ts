@@ -27,7 +27,7 @@ export class FuelReadingInputDto {
     format: 'date-time',
     example: '2026-11-21T10:00:00Z',
     description:
-      'End of the measured period, ISO-8601 UTC (millisecond precision; at most TELEMETRY_MAX_FUTURE_SKEW_MIN ahead)',
+      'End of the measured period, ISO-8601 UTC (millisecond precision; at most TELEMETRY_MAX_FUTURE_SKEW_MIN ahead and TELEMETRY_MAX_AGE_DAYS old)',
   })
   @IsUtcDateTime()
   readonly time!: string;

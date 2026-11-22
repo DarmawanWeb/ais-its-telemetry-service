@@ -40,13 +40,22 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
     );
     expect(rows.map((row) => row.name)).toEqual(['init', 'fuel_aggregates']);
 
-    const hypertables = await service.pool.query<{ hypertable_name: string; compression_enabled: boolean }>(
+    const hypertables = await service.pool.query<{
+      hypertable_name: string;
+      compression_enabled: boolean;
+    }>(
       `SELECT hypertable_name, compression_enabled FROM timescaledb_information.hypertables
        WHERE hypertable_schema = 'telemetry' ORDER BY hypertable_name`,
     );
-    expect(hypertables.rows).toContainEqual({ hypertable_name: 'fuel_readings', compression_enabled: true });
+    expect(hypertables.rows).toContainEqual({
+      hypertable_name: 'fuel_readings',
+      compression_enabled: true,
+    });
 
-    const jobs = await service.pool.query<{ proc_name: string; target: string }>(
+    const jobs = await service.pool.query<{
+      proc_name: string;
+      target: string;
+    }>(
       `SELECT j.proc_name, coalesce(c.view_name, j.hypertable_name) AS target
        FROM timescaledb_information.jobs j
        LEFT JOIN timescaledb_information.continuous_aggregates c
@@ -59,8 +68,14 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
       expect.arrayContaining([
         { proc_name: 'policy_compression', target: 'fuel_readings' },
         { proc_name: 'policy_retention', target: 'fuel_readings' },
-        { proc_name: 'policy_refresh_continuous_aggregate', target: 'fuel_hourly' },
-        { proc_name: 'policy_refresh_continuous_aggregate', target: 'fuel_daily' },
+        {
+          proc_name: 'policy_refresh_continuous_aggregate',
+          target: 'fuel_hourly',
+        },
+        {
+          proc_name: 'policy_refresh_continuous_aggregate',
+          target: 'fuel_daily',
+        },
       ]),
     );
   });

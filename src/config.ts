@@ -35,6 +35,8 @@ export const configSchema = defineConfig({
   TELEMETRY_ACTIVE_WINDOW_MIN: envInteger(1, 1440).default(10),
   /** Readings may be at most this many minutes ahead of the server clock (spec §13.4). */
   TELEMETRY_MAX_FUTURE_SKEW_MIN: envInteger(0, 60).default(5),
+  /** Readings may be at most this many days old (≤ the 5-year retention of `fuel_readings`). */
+  TELEMETRY_MAX_AGE_DAYS: envInteger(1, 1825).default(1825),
   /** Largest main-engine fuel of one reading, t (v2 design default, ~1.5 × a day of the largest 2-stroke engines). */
   TELEMETRY_MAX_FUEL_ME_TON: envTonnes(100_000).default(500),
   /** Largest auxiliary-engine fuel of one reading, t (v2 design default). */
@@ -60,6 +62,7 @@ export function readingLimitsOf(config: Config): ReadingLimits {
     maxFuelMeTon: config.TELEMETRY_MAX_FUEL_ME_TON,
     maxFuelAeTon: config.TELEMETRY_MAX_FUEL_AE_TON,
     maxFutureSkewMs: config.TELEMETRY_MAX_FUTURE_SKEW_MIN * 60_000,
+    maxAgeMs: config.TELEMETRY_MAX_AGE_DAYS * 86_400_000,
     maxPeriodMs: config.TELEMETRY_MAX_PERIOD_H * 3_600_000,
   };
 }

@@ -34,6 +34,7 @@ describe('configSchema', () => {
     expect(config).toMatchObject({
       TELEMETRY_ACTIVE_WINDOW_MIN: 10,
       TELEMETRY_MAX_FUTURE_SKEW_MIN: 5,
+      TELEMETRY_MAX_AGE_DAYS: 1825,
       TELEMETRY_MAX_FUEL_ME_TON: 500,
       TELEMETRY_MAX_FUEL_AE_TON: 100,
       TELEMETRY_MAX_PERIOD_H: 24,
@@ -44,6 +45,7 @@ describe('configSchema', () => {
       maxFuelMeTon: 500,
       maxFuelAeTon: 100,
       maxFutureSkewMs: 300_000,
+      maxAgeMs: 1825 * 86_400_000,
       maxPeriodMs: 86_400_000,
     });
   });
@@ -56,6 +58,15 @@ describe('configSchema', () => {
       ConfigValidationError,
     );
     expect(() => load({ TELEMETRY_RELAY_AFTER_S: '0' })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  it('keeps the accepted reading age within the 5-year retention', () => {
+    expect(load({ TELEMETRY_MAX_AGE_DAYS: '30' }).TELEMETRY_MAX_AGE_DAYS).toBe(
+      30,
+    );
+    expect(() => load({ TELEMETRY_MAX_AGE_DAYS: '1826' })).toThrow(
       ConfigValidationError,
     );
   });

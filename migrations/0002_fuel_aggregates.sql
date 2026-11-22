@@ -22,12 +22,15 @@ GROUP BY 1, 2
 WITH NO DATA;
 
 COMMENT ON VIEW fuel_hourly IS
-  'Hourly fuel sums per vessel (UTC buckets; refreshed every 15 min over the last 35 days, kept 5 years)';
+  'Hourly fuel sums per vessel (UTC buckets; refreshed every 15 min, kept 5 years)';
 
--- Late readings up to 35 days old (devices that stored and forwarded) are
--- re-materialized by the policy; the last hour is served in real time.
+-- The refresh window has no start (start_offset NULL): a refresh only
+-- re-materializes the buckets of the invalidation log, so late readings of
+-- any age (devices that stored and forwarded, imports of historical data)
+-- are folded in at the next run instead of being left out of a fixed
+-- window. Buckets of the last hour are served in real time.
 SELECT add_continuous_aggregate_policy('fuel_hourly',
-  start_offset => INTERVAL '35 days',
+  start_offset => NULL,
   end_offset => INTERVAL '1 hour',
   schedule_interval => INTERVAL '15 minutes');
 
@@ -48,9 +51,11 @@ GROUP BY 1, 2
 WITH NO DATA;
 
 COMMENT ON VIEW fuel_daily IS
-  'Daily fuel sums per vessel (UTC days, from fuel_hourly; refreshed hourly over the last 40 days, kept indefinitely)';
+  'Daily fuel sums per vessel (UTC days, from fuel_hourly; refreshed hourly, kept indefinitely)';
 
+-- Refreshes of fuel_hourly invalidate the affected days of fuel_daily
+-- (hierarchical aggregate), which this policy then re-materializes.
 SELECT add_continuous_aggregate_policy('fuel_daily',
-  start_offset => INTERVAL '40 days',
+  start_offset => NULL,
   end_offset => INTERVAL '1 day',
   schedule_interval => INTERVAL '1 hour');

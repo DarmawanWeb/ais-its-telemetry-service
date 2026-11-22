@@ -1,5 +1,4 @@
-import { StreamManager } from '@darmawanweb/ais-its-nest/nats';
-import { NatsClient } from '@darmawanweb/ais-its-nest/nats';
+import { NatsClient, StreamManager } from '@darmawanweb/ais-its-nest/nats';
 import { waitFor } from '@darmawanweb/ais-its-nest/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -37,15 +36,30 @@ describe('publication relay', () => {
 
   beforeAll(async () => {
     service = await startTestService({
-      env: { TELEMETRY_RELAY_INTERVAL_MS: '200', TELEMETRY_RELAY_AFTER_S: '1', TELEMETRY_PUBLISH_TIMEOUT_MS: '1000' },
+      env: {
+        TELEMETRY_RELAY_INTERVAL_MS: '200',
+        TELEMETRY_RELAY_AFTER_S: '1',
+        TELEMETRY_PUBLISH_TIMEOUT_MS: '1000',
+      },
     });
     await service.publishVessel({ mmsi, orgId });
     await service.publishVessel({ mmsi: otherMmsi, orgId });
   });
 
+  /**
+   * Recreates the FUEL stream as a producer does at boot. The application's
+   * StreamManager ensures each stream once per process, so a fresh one is used.
+   */
+  const recreateFuelStream = async () => {
+    await new StreamManager(service.app.get(NatsClient)).ensure(
+      ['FUEL'],
+      'producer',
+    );
+  };
+
   afterAll(async () => {
     // Leave the shared NATS with its FUEL stream for the next test files.
-    await service.app.get(StreamManager).ensure(['FUEL'], 'producer');
+    await recreateFuelStream();
     await service.close();
   });
 
@@ -64,7 +78,12 @@ describe('publication relay', () => {
       ],
     });
     expect(response.statusCode).toBe(202);
-    expect(response.json()).toEqual({ received: 2, accepted: 2, duplicates: 0, published: 0 });
+    expect(response.json()).toEqual({
+      received: 2,
+      accepted: 2,
+      duplicates: 0,
+      published: 0,
+    });
     expect(await pending()).toEqual(
       expect.arrayContaining([
         { mmsi, published: false },
@@ -76,8 +95,11 @@ describe('publication relay', () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(await pending()).toHaveLength(2);
 
-    await service.app.get(StreamManager).ensure(['FUEL'], 'producer');
-    await waitFor(async () => (await pending()).length === 0, { timeoutMs: 15_000, message: 'relay did not republish' });
+    await recreateFuelStream();
+    await waitFor(async () => (await pending()).length === 0, {
+      timeoutMs: 15_000,
+      message: 'relay did not republish',
+    });
 
     const { rows } = await service.pool.query<{ published: boolean }>(
       'SELECT published_at IS NOT NULL AS published FROM fuel_readings WHERE mmsi = ANY($1)',
@@ -86,10 +108,19 @@ describe('publication relay', () => {
     expect(rows).toEqual([{ published: true }, { published: true }]);
     const [event] = await readFuelEvents(service.app, mmsi, 1);
     expect(event?.msgId).toBe(`${mmsi}:${time}`);
-    expect(event?.envelope.data).toMatchObject({ mmsi, fuelMeTon: 1.25, source: 'api' });
+    expect(event?.envelope.data).toMatchObject({
+      mmsi,
+      fuelMeTon: 1.25,
+      source: 'api',
+    });
 
-    const metrics = await service.app.inject({ method: 'GET', url: '/metrics' });
-    expect(metrics.body).toMatch(/aisits_telemetry_relayed_total\{outcome="published"\} 2/);
+    const metrics = await service.app.inject({
+      method: 'GET',
+      url: '/metrics',
+    });
+    expect(metrics.body).toMatch(
+      /aisits_telemetry_relayed_total\{outcome="published"\} 2/,
+    );
   });
 
   it('republishes with the same Nats-Msg-Id, so a second relay pass stores no duplicate', async () => {
@@ -110,6 +141,8 @@ describe('publication relay', () => {
       await waitFor(async () => (await pending()).length === 0);
     }
     const events = await readFuelEvents(service.app, mmsi, 3, 1500);
-    expect(events.filter((event) => event.msgId === `${mmsi}:${relayTime}`)).toHaveLength(1);
+    expect(
+      events.filter((event) => event.msgId === `${mmsi}:${relayTime}`),
+    ).toHaveLength(1);
   });
 });

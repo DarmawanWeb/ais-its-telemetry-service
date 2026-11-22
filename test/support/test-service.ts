@@ -58,6 +58,8 @@ export interface TestService {
   publishVessel(
     overrides: Partial<VesselSnapshotV1> & Pick<VesselSnapshotV1, 'mmsi'>,
   ): Promise<VesselSnapshotV1>;
+  /** Publishes `fleet.vessel.deleted.v1` for a snapshot and waits for the tombstone. */
+  deleteVessel(snapshot: VesselSnapshotV1): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -93,6 +95,10 @@ export async function startTestService(
     NATS_DURABLE_PREFIX: uniqueName('t'),
     AUTH_INTERNAL_URL: introspection.url,
     INTERNAL_TOKEN,
+    // `TEST_LOG_LEVEL=debug pnpm test:int` shows the service logs (silent by default).
+    ...(process.env.TEST_LOG_LEVEL === undefined
+      ? {}
+      : { LOG_LEVEL: process.env.TEST_LOG_LEVEL, LOG_PRETTY: 'false' }),
     ...options.env,
   });
   const app = await buildTestApp(AppModule, {
@@ -145,6 +151,25 @@ export async function startTestService(
         { timeoutMs: 15_000, message: `vessel ${snapshot.mmsi} not projected` },
       );
       return snapshot;
+    },
+    deleteVessel: async (snapshot) => {
+      await app
+        .get(EventPublisher)
+        .publishEvent(EVENT_TYPES.FLEET_VESSEL_DELETED, {
+          id: snapshot.id,
+          mmsi: snapshot.mmsi,
+          orgId: snapshot.orgId,
+        });
+      await waitFor(
+        async () =>
+          (
+            await pool.query(
+              'SELECT 1 FROM vessels WHERE vessel_id = $1 AND deleted_at IS NOT NULL',
+              [snapshot.id],
+            )
+          ).rowCount === 1,
+        { timeoutMs: 15_000, message: `vessel ${snapshot.mmsi} not deleted` },
+      );
     },
     close: async () => {
       await app.close();

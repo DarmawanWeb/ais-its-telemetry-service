@@ -15,6 +15,7 @@ const LIMITS: ReadingLimits = {
   maxFuelMeTon: 500,
   maxFuelAeTon: 100,
   maxFutureSkewMs: 5 * 60_000,
+  maxAgeMs: 1825 * 86_400_000,
   maxPeriodMs: 24 * 3_600_000,
 };
 
@@ -62,6 +63,15 @@ describe('readingViolations', () => {
     expect(readingViolations(at(6 * 60_000), 0, LIMITS, NOW)[0]?.message).toBe(
       'time must not be more than 5 min ahead of the server clock',
     );
+  });
+
+  it('refuses readings older than the retention period', () => {
+    const ago = (ms: number) => reading({ time: new Date(NOW.getTime() - ms) });
+    expect(codesOf(ago(1825 * 86_400_000))).toEqual([]);
+    expect(codesOf(ago(1825 * 86_400_000 + 1))).toEqual(['time:too_old']);
+    expect(
+      readingViolations(ago(1826 * 86_400_000), 0, LIMITS, NOW)[0]?.message,
+    ).toBe('time must not be more than 1825 d in the past (retention period)');
   });
 
   it('requires periodStart before time and a period of at most 24 h', () => {

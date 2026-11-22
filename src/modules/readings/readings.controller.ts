@@ -72,8 +72,9 @@ export class ReadingsController {
   @ApiOperation({
     summary: 'Ingest fuel readings (one object or an array of ≤ 1000)',
     description:
-      'All or nothing: every reading is validated (non-negative, ≤ configured maxima, time ≤ now + TELEMETRY_MAX_FUTURE_SKEW_MIN, ' +
-      'periodStart before time) and every vessel must belong to the caller’s organization before anything is stored. ' +
+      'All or nothing: every reading is validated (non-negative, ≤ configured maxima, time ≤ now + TELEMETRY_MAX_FUTURE_SKEW_MIN ' +
+      'and at most TELEMETRY_MAX_AGE_DAYS old, periodStart before time) and every vessel must belong to the caller’s organization ' +
+      'before anything is stored. ' +
       'Readings are idempotent by (mmsi, time): repeats are counted as duplicates. Stored readings are published as ' +
       'fuel.reading.recorded.v1 after the commit (Nats-Msg-Id <mmsi>:<time>). Error fields are `<index>.<field>`.',
   })
@@ -133,7 +134,9 @@ export class ReadingsController {
   @ApiOperation({
     summary: 'Readings of a vessel, raw or as hourly / daily sums',
     description:
-      'Ascending in time; `[from, to)`; buckets whose start lies in the range.',
+      'Ascending in time; `[from, to)`; buckets whose start lies in the range. Hourly and daily sums come from the ' +
+      'continuous aggregates: readings stored more than an hour after their time (store and forward, imports) are ' +
+      'included after the next refresh (fuel_hourly every 15 min, fuel_daily hourly).',
   })
   @ApiParam(MMSI_PARAM)
   @ApiCursorResponse(FuelSeriesPointDto)
@@ -154,7 +157,8 @@ export class ReadingsController {
   @ApiOperation({
     summary: 'Fuel totals of a vessel over a time range',
     description:
-      'Readings with time in `[from, to)` (default: the last 30 days, at most 5 years).',
+      'Readings with time in `[from, to)` (default: the last 30 days, at most 5 years): whole UTC days from fuel_daily, ' +
+      'whole hours from fuel_hourly, the edges from the raw readings (late readings: see the readings endpoint).',
   })
   @ApiParam(MMSI_PARAM)
   @ApiOkResponse({ type: FuelSummaryDto })

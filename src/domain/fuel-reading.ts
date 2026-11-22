@@ -53,6 +53,11 @@ export interface ReadingLimits {
   readonly maxFuelAeTon: number;
   /** How far `time` may lie ahead of the server clock (device clock skew), ms. */
   readonly maxFutureSkewMs: number;
+  /**
+   * How far `time` may lie behind the server clock, ms: at most the 5-year
+   * retention of `fuel_readings`, whose policy would drop older readings.
+   */
+  readonly maxAgeMs: number;
   /** Longest measured period `time − periodStart`, ms. */
   readonly maxPeriodMs: number;
 }
@@ -63,6 +68,7 @@ export type ReadingViolationCode =
   | 'not_finite'
   | 'above_maximum'
   | 'future_time'
+  | 'too_old'
   | 'period_not_before_time'
   | 'period_too_long';
 
@@ -77,8 +83,9 @@ export interface ReadingViolation {
 /**
  * Plausibility rules of one reading (spec §13.4): fuel amounts are finite,
  * non-negative and at most the configured maxima (t); `time` is at most
- * `maxFutureSkewMs` ahead of `now`; a `periodStart` lies before `time` and
- * the period lasts at most `maxPeriodMs`. Pure: the caller passes the clock.
+ * `maxFutureSkewMs` ahead of `now` and at most `maxAgeMs` behind it (the
+ * retention period); a `periodStart` lies before `time` and the period
+ * lasts at most `maxPeriodMs`. Pure: the caller passes the clock.
  *
  * Not in the methodology catalog yet (proposed id `telemetry.reading_validation`);
  * the maxima are v2 design defaults, not values from a cited source.
@@ -128,6 +135,13 @@ export function readingViolations(
       field: 'time',
       code: 'future_time',
       message: `time must not be more than ${formatMinutes(limits.maxFutureSkewMs)} ahead of the server clock`,
+    });
+  } else if (-aheadMs > limits.maxAgeMs) {
+    violations.push({
+      index,
+      field: 'time',
+      code: 'too_old',
+      message: `time must not be more than ${formatMinutes(limits.maxAgeMs)} in the past (retention period)`,
     });
   }
 
@@ -195,8 +209,9 @@ export function dedupeReadings<T extends FuelReadingInput>(
   return { unique, duplicates: readings.length - unique.length };
 }
 
-/** `5 min`, `24 h`, `90 s` for messages. */
+/** `5 min`, `24 h`, `1825 d`, `90 s` for messages. */
 function formatMinutes(ms: number): string {
+  if (ms >= 86_400_000 && ms % 86_400_000 === 0) return `${ms / 86_400_000} d`;
   if (ms % 3_600_000 === 0) return `${ms / 3_600_000} h`;
   if (ms % 60_000 === 0) return `${ms / 60_000} min`;
   return `${ms / 1000} s`;
