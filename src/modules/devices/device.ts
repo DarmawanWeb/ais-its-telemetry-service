@@ -61,6 +61,9 @@ export const DEVICE_NAME_CONSTRAINT = 'devices_org_name_key';
 /** Unique constraint `(org_id, api_key_id)` of `0001_init.sql`. */
 export const DEVICE_API_KEY_CONSTRAINT = 'devices_org_api_key_key';
 
+/** CHECK constraint of the credential rule ({@link deviceCredentialError}) of `0001_init.sql`. */
+export const DEVICE_CREDENTIAL_CONSTRAINT = 'devices_kind_api_key_check';
+
 /** Readings refresh `last_seen_at` at most once per this interval, ms. */
 export const LAST_SEEN_RESOLUTION_MS = 60_000;
 

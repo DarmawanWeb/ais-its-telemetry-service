@@ -292,4 +292,52 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
     expect(await storedReadings(devices.moved)).toEqual([]);
     expect(await storedReadings(devices.deleted)).toEqual([]);
   });
+  it('leaves out readings of a second meter at an instant the vessel has a reading for, and counts the conflict', async () => {
+    const aeMeter = await registerDevice({
+      mmsi: vessel,
+      name: 'AE meter',
+      kind: 'mqtt',
+    });
+    const time = minutesAgo(45);
+    await sendAndCount('accepted', devices.meter, {
+      time,
+      fuelMeTon: 1.5,
+      fuelAeTon: 0,
+    });
+    const conflictsBefore = await metricValue(
+      service.app,
+      'aisits_telemetry_readings_total',
+      { source: 'mqtt', outcome: 'conflict' },
+    );
+
+    // Same instant from the other meter: not a duplicate, not stored.
+    await sendAndCount('conflict', aeMeter, {
+      time,
+      fuelMeTon: 0,
+      fuelAeTon: 0.3,
+    });
+    expect(await storedReadings(aeMeter)).toEqual([]);
+
+    // Store and forward: the conflicting reading is left out, the rest is kept.
+    const next = minutesAgo(44);
+    await sendAndCount('conflict', aeMeter, [
+      { time, fuelMeTon: 0, fuelAeTon: 0.3 },
+      { time: next, fuelMeTon: 0, fuelAeTon: 0.2 },
+    ]);
+    expect(
+      (await storedReadings(aeMeter)).map((row) => row.time.toISOString()),
+    ).toEqual([next]);
+    expect(
+      await metricValue(service.app, 'aisits_telemetry_readings_total', {
+        source: 'mqtt',
+        outcome: 'conflict',
+      }),
+    ).toBe(conflictsBefore + 2);
+
+    const { rows } = await service.pool.query<{ device_id: string }>(
+      'SELECT device_id FROM fuel_readings WHERE mmsi = $1 AND time = $2',
+      [vessel, time],
+    );
+    expect(rows).toEqual([{ device_id: devices.meter }]);
+  });
 });

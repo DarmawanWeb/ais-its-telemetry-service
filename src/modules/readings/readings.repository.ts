@@ -21,9 +21,14 @@ import {
   EMPTY_TOTALS,
   type FuelBucket,
   type FuelTotals,
+  roundFuelSum,
   type SummaryPiece,
 } from '../../domain/fuel-aggregation.js';
-import type { FuelReadingSource } from '../../domain/fuel-reading.js';
+import {
+  compareWithStored,
+  type FuelReadingSource,
+  groupByStorageWindow,
+} from '../../domain/fuel-reading.js';
 import type { TenantScope } from '../vessels/vessel.js';
 import type { NewReading, StoredReading } from './reading.js';
 
@@ -87,8 +92,32 @@ export interface RelayBatchResult {
   readonly orphaned: number;
 }
 
+/** What {@link ReadingsRepository.store} did with the readings of one window. */
+export interface StoreResult {
+  /** Readings stored (and queued for publication) by this call. */
+  readonly stored: StoredReading[];
+  /** Readings whose key holds the same measurement of the same device already (idempotent). */
+  readonly duplicates: NewReading[];
+  /** Readings whose key holds a different reading already; never stored, never overwriting. */
+  readonly conflicts: NewReading[];
+  /**
+   * `true` when conflicts aborted the transaction (`rejectConflicts`):
+   * nothing of the window was stored, `stored` is empty.
+   */
+  readonly rejected: boolean;
+}
+
 /** The key of a stored reading. */
 type ReadingKeyed = Pick<StoredReading, 'mmsi' | 'time'>;
+
+/** Aborts a store transaction on conflicts while carrying its result out. */
+class ConflictRollback extends Error {
+  override readonly name = 'ConflictRollback';
+
+  constructor(readonly result: StoreResult) {
+    super('readings conflict with stored readings');
+  }
+}
 
 /** A database handle or an open transaction. */
 type Executor = Pick<
@@ -98,49 +127,96 @@ type Executor = Pick<
 
 /**
  * Access to `fuel_readings`, its publication queue and the continuous
- * aggregates. Bulk statements bind arrays (`unnest`) so that a batch of
- * 1 000 readings costs a constant number of parameters, and bound the time
- * range so that TimescaleDB prunes chunks at plan time.
+ * aggregates. Bulk statements on stored keys bind arrays (`unnest`) so that
+ * 1 000 keys cost a constant number of parameters, and run per storage
+ * window with constant MMSI and time bounds so that TimescaleDB prunes
+ * chunks and compressed batches.
  */
 @Injectable()
 export class ReadingsRepository {
   constructor(@InjectDb() private readonly db: Database<typeof schema>) {}
 
   /**
-   * Stores new readings and queues them for publication in one transaction;
-   * readings whose `(mmsi, time)` exists already are skipped (idempotent).
+   * Stores the readings of one storage window (one UTC day, see
+   * `groupByStorageWindow`) and queues them for publication, in one
+   * transaction. A reading whose `(mmsi, time)` exists already is not
+   * written: it is a duplicate when the stored reading is the same
+   * measurement of the same device, else a conflict (`compareWithStored`).
+   * With `rejectConflicts` any conflict rolls the whole window back.
    *
-   * @returns the readings stored by this call.
+   * Concurrent writers of a key serialize on the primary key: the second
+   * `INSERT … ON CONFLICT DO NOTHING` waits for the first transaction and
+   * then compares against its committed row (READ COMMITTED snapshot of the
+   * next statement).
    */
-  async insert(readings: readonly NewReading[]): Promise<StoredReading[]> {
-    if (readings.length === 0) return [];
-    return this.db.transaction(async (tx) => {
-      const stored = await tx
-        .insert(fuelReadings)
-        .values(
-          readings.map((reading) => ({
-            time: reading.time,
-            mmsi: reading.mmsi,
-            deviceId: reading.deviceId,
-            periodStart: reading.periodStart,
-            fuelMeTon: reading.fuelMeTon,
-            fuelAeTon: reading.fuelAeTon,
-            source: reading.source,
-          })),
-        )
-        .onConflictDoNothing({ target: [fuelReadings.mmsi, fuelReadings.time] })
-        .returning(storedColumns);
-      if (stored.length > 0) {
-        await tx.insert(fuelReadingsUnpublished).values(
-          stored.map((reading) => ({
-            mmsi: reading.mmsi,
-            time: reading.time,
-            receivedAt: reading.receivedAt,
-          })),
+  async store(
+    readings: readonly NewReading[],
+    options: { readonly rejectConflicts: boolean },
+  ): Promise<StoreResult> {
+    if (readings.length === 0) {
+      return { stored: [], duplicates: [], conflicts: [], rejected: false };
+    }
+    try {
+      return await this.db.transaction(async (tx) => {
+        const stored = await tx
+          .insert(fuelReadings)
+          .values(
+            readings.map((reading) => ({
+              time: reading.time,
+              mmsi: reading.mmsi,
+              deviceId: reading.deviceId,
+              periodStart: reading.periodStart,
+              fuelMeTon: reading.fuelMeTon,
+              fuelAeTon: reading.fuelAeTon,
+              source: reading.source,
+            })),
+          )
+          .onConflictDoNothing({
+            target: [fuelReadings.mmsi, fuelReadings.time],
+          })
+          .returning(storedColumns);
+        const storedKeys = new Set(stored.map(keyOf));
+        const skipped = readings.filter(
+          (reading) => !storedKeys.has(keyOf(reading)),
         );
-      }
-      return stored;
-    });
+        const existing =
+          skipped.length === 0 ? [] : await selectByKeys(tx, skipped);
+        const { fresh, duplicates, conflicts } = compareWithStored(
+          skipped,
+          existing,
+        );
+        // `fresh` here: the row that blocked the insert is gone already
+        // (retention dropped its chunk); nothing is left to conflict with.
+        const result: StoreResult = {
+          stored,
+          duplicates: [...duplicates, ...fresh],
+          conflicts,
+          rejected: false,
+        };
+        if (conflicts.length > 0 && options.rejectConflicts) {
+          throw new ConflictRollback({ ...result, stored: [], rejected: true });
+        }
+        if (stored.length > 0) {
+          await tx.insert(fuelReadingsUnpublished).values(
+            stored.map((reading) => ({
+              mmsi: reading.mmsi,
+              time: reading.time,
+              receivedAt: reading.receivedAt,
+            })),
+          );
+        }
+        return result;
+      });
+    } catch (error) {
+      if (error instanceof ConflictRollback) return error.result;
+      throw error;
+    }
+  }
+
+  /** The stored readings with the given keys (read only; missing keys are absent). */
+  async findStored(keys: readonly ReadingKeyed[]): Promise<StoredReading[]> {
+    if (keys.length === 0) return [];
+    return selectByKeys(this.db, keys);
   }
 
   /** Marks readings as stored in the FUEL stream and dequeues them (one transaction). */
@@ -265,8 +341,8 @@ export class ReadingsRepository {
       .limit(query.limit);
     return rows.map((row) => ({
       time: row.bucket,
-      fuelMeTon: row.fuelMeTon,
-      fuelAeTon: row.fuelAeTon,
+      fuelMeTon: roundFuelSum(row.fuelMeTon),
+      fuelAeTon: roundFuelSum(row.fuelAeTon),
       readings: row.readings,
       periodStart: null,
       source: null,
@@ -296,8 +372,8 @@ export class ReadingsRepository {
         ? EMPTY_TOTALS
         : {
             readings: row.readings,
-            fuelMeTon: row.fuel_me_ton ?? 0,
-            fuelAeTon: row.fuel_ae_ton ?? 0,
+            fuelMeTon: roundFuelSum(row.fuel_me_ton ?? 0),
+            fuelAeTon: roundFuelSum(row.fuel_ae_ton ?? 0),
             firstReadingAt: asNullableDate(row.first_time),
             lastReadingAt: asNullableDate(row.last_time),
           },
@@ -396,70 +472,111 @@ function pieceTotalsQuery(mmsi: number, piece: SummaryPiece): SQL {
       AND ${view.bucket} >= ${piece.from} AND ${view.bucket} < ${piece.to})`;
 }
 
-/** The stored readings of the given keys. */
+/**
+ * The stored readings of the given keys: one statement per storage window
+ * (UTC day), each bounded by the window's MMSIs and time range.
+ */
 async function selectByKeys(
   executor: Executor,
   keys: readonly ReadingKeyed[],
 ): Promise<StoredReading[]> {
-  const { mmsis, times, from, to } = keyArrays(keys);
-  const result = await executor.execute<{
-    time: Date | string;
-    mmsi: number;
-    device_id: string | null;
-    period_start: Date | string | null;
-    fuel_me_ton: number;
-    fuel_ae_ton: number;
-    source: FuelReadingSource;
-    received_at: Date | string;
-  }>(sql`
-    SELECT r.time, r.mmsi, r.device_id, r.period_start, r.fuel_me_ton, r.fuel_ae_ton,
-           r.source, r.received_at
-    FROM ${fuelReadings} r
-    JOIN unnest(${sql.param(mmsis)}::integer[], ${sql.param(times)}::timestamptz[]) AS k(mmsi, time)
-      ON r.mmsi = k.mmsi AND r.time = k.time
-    WHERE r.time >= ${from} AND r.time <= ${to}`);
-  return result.rows.map((row) => ({
-    time: asDate(row.time),
-    mmsi: row.mmsi,
-    deviceId: row.device_id,
-    periodStart: asNullableDate(row.period_start),
-    fuelMeTon: row.fuel_me_ton,
-    fuelAeTon: row.fuel_ae_ton,
-    source: row.source,
-    receivedAt: asDate(row.received_at),
-  }));
+  const rows: StoredReading[] = [];
+  for (const window of groupByStorageWindow(keys)) {
+    const { mmsis, vessels, times, from, to } = keyArrays(window);
+    const result = await executor.execute<{
+      time: Date | string;
+      mmsi: number;
+      device_id: string | null;
+      period_start: Date | string | null;
+      fuel_me_ton: number;
+      fuel_ae_ton: number;
+      source: FuelReadingSource;
+      received_at: Date | string;
+    }>(sql`
+      SELECT r.time, r.mmsi, r.device_id, r.period_start, r.fuel_me_ton, r.fuel_ae_ton,
+             r.source, r.received_at
+      FROM ${fuelReadings} r
+      JOIN unnest(${sql.param(mmsis)}::integer[], ${sql.param(times)}::timestamptz[]) AS k(mmsi, time)
+        ON r.mmsi = k.mmsi AND r.time = k.time
+      WHERE r.mmsi = ANY(${sql.param(vessels)}::integer[])
+        AND r.time >= ${from} AND r.time <= ${to}`);
+    for (const row of result.rows) {
+      rows.push({
+        time: asDate(row.time),
+        mmsi: row.mmsi,
+        deviceId: row.device_id,
+        periodStart: asNullableDate(row.period_start),
+        fuelMeTon: row.fuel_me_ton,
+        fuelAeTon: row.fuel_ae_ton,
+        source: row.source,
+        receivedAt: asDate(row.received_at),
+      });
+    }
+  }
+  return rows;
 }
 
-/** Sets `published_at` of the readings and removes them from the queue. */
+/**
+ * Sets `published_at` of the readings and removes them from the queue.
+ * Runs inside the caller's transaction.
+ *
+ * `published_at` feeds no continuous aggregate, so the update is excluded
+ * from invalidation logging (`SET LOCAL timescaledb.skip_cagg_invalidation`,
+ * TimescaleDB ≥ 2.22, a user-settable parameter): otherwise every late
+ * reading would be invalidated twice, the second time over the whole range
+ * of the request or relay batch, and the next refresh would re-aggregate
+ * that range for every vessel although no sum changed.
+ *
+ * Readings of compressed chunks (imports, store-and-forward data older than
+ * the 7-day compression delay) are updated by decompressing the batches
+ * that may hold them. TimescaleDB selects those batches only by constant
+ * conditions on the `segmentby` column (`mmsi`) and the time range — never
+ * by the key join — so every statement names its MMSIs with `= ANY(…)` and
+ * covers one storage window (UTC day): only the batches of these vessels
+ * that overlap the window's key range are decompressed, not those of every
+ * vessel in a range spanning the whole key set.
+ */
 async function markPublishedWith(
   executor: Executor,
   keys: readonly ReadingKeyed[],
 ): Promise<void> {
   if (keys.length === 0) return;
-  const { mmsis, times, from, to } = keyArrays(keys);
-  const keyTable = sql`unnest(${sql.param(mmsis)}::integer[], ${sql.param(times)}::timestamptz[]) AS k(mmsi, time)`;
-  await executor.execute(sql`
-    UPDATE ${fuelReadings} r SET published_at = now()
-    FROM ${keyTable}
-    WHERE r.mmsi = k.mmsi AND r.time = k.time
-      AND r.time >= ${from} AND r.time <= ${to}
-      AND r.published_at IS NULL`);
+  await executor.execute(
+    sql`SET LOCAL timescaledb.skip_cagg_invalidation = on`,
+  );
+  for (const window of groupByStorageWindow(keys)) {
+    const { mmsis, vessels, times, from, to } = keyArrays(window);
+    await executor.execute(sql`
+      UPDATE ${fuelReadings} r SET published_at = now()
+      FROM unnest(${sql.param(mmsis)}::integer[], ${sql.param(times)}::timestamptz[]) AS k(mmsi, time)
+      WHERE r.mmsi = ANY(${sql.param(vessels)}::integer[])
+        AND r.mmsi = k.mmsi AND r.time = k.time
+        AND r.time >= ${from} AND r.time <= ${to}
+        AND r.published_at IS NULL`);
+  }
+  const { mmsis, times } = keyArrays(keys);
   await executor.execute(sql`
     DELETE FROM ${fuelReadingsUnpublished} u
-    USING ${keyTable}
+    USING unnest(${sql.param(mmsis)}::integer[], ${sql.param(times)}::timestamptz[]) AS k(mmsi, time)
     WHERE u.mmsi = k.mmsi AND u.time = k.time`);
 }
 
-/** Parallel arrays of keys (ISO strings for exact timestamps) and their time bounds. */
+/**
+ * Parallel arrays of keys (ISO strings for exact timestamps), their distinct
+ * MMSIs (the scalar `segmentby` predicate) and their time bounds.
+ */
 function keyArrays(keys: readonly ReadingKeyed[]): {
   mmsis: number[];
+  vessels: number[];
   times: string[];
   from: Date;
   to: Date;
 } {
   const millis = keys.map((key) => key.time.getTime());
+  const mmsis = keys.map((key) => key.mmsi);
   return {
-    mmsis: keys.map((key) => key.mmsi),
+    mmsis,
+    vessels: [...new Set(mmsis)],
     times: keys.map((key) => key.time.toISOString()),
     from: new Date(Math.min(...millis)),
     to: new Date(Math.max(...millis)),

@@ -19,10 +19,14 @@ describe('hypertable and continuous aggregates', () => {
   let service: TestService;
   let manager: { authorization: string };
   const orgId = newOrgId();
-  const [importedVessel, compressedVessel] = uniqueMmsis(2) as [number, number];
+  const [importedVessel, compressedVessel, spreadVessel] = uniqueMmsis(3) as [
+    number,
+    number,
+    number,
+  ];
 
-  /** Runs the refresh policy of a continuous aggregate now (as its schedule would). */
-  const runRefreshPolicy = async (view: 'fuel_hourly' | 'fuel_daily') => {
+  /** The id of the refresh policy job of a continuous aggregate. */
+  const refreshJobOf = async (view: 'fuel_hourly' | 'fuel_daily') => {
     const { rows } = await service.pool.query<{ job_id: number }>(
       // jobs names the aggregate itself (TimescaleDB 2.32) or, in older
       // releases, its materialization hypertable.
@@ -36,7 +40,22 @@ describe('hypertable and continuous aggregates', () => {
       [view],
     );
     expect(rows).toHaveLength(1);
-    await service.pool.query('CALL run_job($1)', [rows[0]?.job_id]);
+    return rows[0]?.job_id;
+  };
+
+  /** Runs the refresh policy of a continuous aggregate now (as its schedule would). */
+  const runRefreshPolicy = async (view: 'fuel_hourly' | 'fuel_daily') => {
+    await service.pool.query('CALL run_job($1)', [await refreshJobOf(view)]);
+  };
+
+  /** Pauses or resumes the schedules of both refresh policies. */
+  const scheduleRefreshPolicies = async (scheduled: boolean) => {
+    for (const view of ['fuel_hourly', 'fuel_daily'] as const) {
+      await service.pool.query('SELECT alter_job($1, scheduled => $2)', [
+        await refreshJobOf(view),
+        scheduled,
+      ]);
+    }
   };
 
   const post = (body: object, query = '') =>
@@ -59,6 +78,7 @@ describe('hypertable and continuous aggregates', () => {
     manager = await service.authorization({ roles: ['fleet_manager'], orgId });
     await service.publishVessel({ mmsi: importedVessel, orgId });
     await service.publishVessel({ mmsi: compressedVessel, orgId });
+    await service.publishVessel({ mmsi: spreadVessel, orgId });
   });
 
   afterAll(async () => {
@@ -133,6 +153,64 @@ describe('hypertable and continuous aggregates', () => {
     });
   });
 
+  it('stores each UTC day of a request in its own transaction: refreshes re-aggregate those days only', async () => {
+    // Two readings 5 days apart in one 7-day chunk (chunks start at multiples
+    // of 7 days since the Unix epoch), far from the other tests' data.
+    const week = 7 * DAY_MS;
+    const chunkStart = Math.floor((Date.now() - 700 * DAY_MS) / week) * week;
+    const first = new Date(chunkStart + DAY_MS + 3 * HOUR_MS);
+    const last = new Date(chunkStart + 6 * DAY_MS + 20 * HOUR_MS);
+    /** Invalidation ranges logged for fuel_readings within [first, last] (TimescaleDB catalog, µs since the epoch). */
+    const invalidations = async () =>
+      (
+        await service.pool.query<{ lowest: string; greatest: string }>(
+          `SELECT l.lowest_modified_value::text AS lowest, l.greatest_modified_value::text AS greatest
+           FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log l
+           JOIN _timescaledb_catalog.hypertable h ON h.id = l.hypertable_id
+           WHERE h.schema_name = 'telemetry' AND h.table_name = 'fuel_readings'
+             AND l.greatest_modified_value >= $1 AND l.lowest_modified_value <= $2
+           ORDER BY l.lowest_modified_value`,
+          [first.getTime() * 1000, last.getTime() * 1000],
+        )
+      ).rows.map(({ lowest, greatest }) => [
+        new Date(Number(BigInt(lowest) / 1000n)).toISOString(),
+        new Date(Number(BigInt(greatest) / 1000n)).toISOString(),
+      ]);
+
+    // Invalidations are logged below the materialization threshold (set by a
+    // refresh); no policy run may consume the log before the check.
+    await runRefreshPolicy('fuel_hourly');
+    await scheduleRefreshPolicies(false);
+    try {
+      const response = await post(
+        [
+          {
+            mmsi: spreadVessel,
+            time: first.toISOString(),
+            fuelMeTon: 1,
+            fuelAeTon: 0,
+          },
+          {
+            mmsi: spreadVessel,
+            time: last.toISOString(),
+            fuelMeTon: 1,
+            fuelAeTon: 0,
+          },
+        ],
+        '?source=import',
+      );
+      expect(response.json()).toMatchObject({ accepted: 2 });
+
+      // One transaction would have logged [first, last]: 5 days of every vessel.
+      expect(await invalidations()).toEqual([
+        [first.toISOString(), first.toISOString()],
+        [last.toISOString(), last.toISOString()],
+      ]);
+    } finally {
+      await scheduleRefreshPolicies(true);
+    }
+  });
+
   it('keeps readings of compressed chunks idempotent and accepts new ones there', async () => {
     // 10:00 UTC of a day 300 days ago: the reading an hour later is in the same 7-day chunk.
     const time = new Date(
@@ -166,14 +244,16 @@ describe('hypertable and continuous aggregates', () => {
     );
     expect(chunks).toEqual([{ is_compressed: true }]);
 
-    expect(
-      (await post({ ...reading, fuelMeTon: 9 }, '?source=import')).json(),
-    ).toEqual({
+    // Repeats are compared with the stored reading inside the compressed chunk.
+    expect((await post(reading, '?source=import')).json()).toEqual({
       received: 1,
       accepted: 0,
       duplicates: 1,
       published: 0,
     });
+    const conflict = await post({ ...reading, fuelMeTon: 9 }, '?source=import');
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json()).toMatchObject({ code: 'READING_CONFLICT' });
     const later = {
       ...reading,
       time: new Date(time.getTime() + HOUR_MS).toISOString(),

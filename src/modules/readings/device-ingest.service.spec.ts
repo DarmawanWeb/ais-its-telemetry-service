@@ -76,6 +76,7 @@ describe('DeviceIngestService', () => {
       received: 1,
       accepted: 1,
       duplicates: 0,
+      conflicts: 0,
       published: 1,
     });
     metrics = new TelemetryMetrics(new MetricsService());
@@ -94,19 +95,23 @@ describe('DeviceIngestService', () => {
       'accepted',
     );
 
-    expect(ingest).toHaveBeenCalledWith({
-      readings: [
-        {
-          mmsi: 525005223,
-          time: new Date(READING.time),
-          periodStart: null,
-          fuelMeTon: 0.4,
-          fuelAeTon: 0.05,
-        },
-      ],
-      source: 'mqtt',
-      deviceId: DEVICE_ID,
-    });
+    expect(ingest).toHaveBeenCalledWith(
+      {
+        readings: [
+          {
+            mmsi: 525005223,
+            time: new Date(READING.time),
+            periodStart: null,
+            fuelMeTon: 0.4,
+            fuelAeTon: 0.05,
+          },
+        ],
+        source: 'mqtt',
+        deviceId: DEVICE_ID,
+      },
+      // MQTT has no one to answer: conflicting readings are left out, the rest is stored.
+      'skip',
+    );
     expect(markSeen).toHaveBeenCalledWith(DEVICE_ID, NOW);
     expect(await counted('accepted')).toBe(1);
   });
@@ -116,11 +121,27 @@ describe('DeviceIngestService', () => {
       received: 1,
       accepted: 0,
       duplicates: 1,
+      conflicts: 0,
       published: 0,
     });
     await expect(service.handle(SUBJECT, body(READING))).resolves.toBe(
       'duplicate',
     );
+  });
+
+  it('counts a message with readings that conflict with stored ones as conflict', async () => {
+    ingest.mockResolvedValue({
+      received: 2,
+      accepted: 1,
+      duplicates: 0,
+      conflicts: 1,
+      published: 1,
+    });
+    await expect(
+      service.handle(SUBJECT, body([READING, { ...READING, time: NOW }])),
+    ).resolves.toBe('conflict');
+    expect(markSeen).toHaveBeenCalledWith(DEVICE_ID, NOW);
+    expect(await counted('conflict')).toBe(1);
   });
 
   it.each([

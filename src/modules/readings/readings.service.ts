@@ -22,13 +22,16 @@ import {
   decodeQueryCursor,
   resolveQueryTimeRange,
 } from '@darmawanweb/ais-its-nest/http';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import * as z from 'zod';
 
 import { CLOCK, type Clock } from '../../common/clock.js';
+import { settledWithin } from '../../common/deadline.js';
 import {
   DeviceInactiveError,
   DeviceVesselMismatchError,
+  type ReadingConflict,
+  ReadingConflictError,
 } from '../../common/errors.js';
 import { type Config, readingLimitsOf } from '../../config.js';
 import {
@@ -44,6 +47,7 @@ import {
   batchViolations,
   type FuelReadingInput,
   type FuelReadingSource,
+  readingKey,
   type ReadingLimits,
   type UserReadingSource,
 } from '../../domain/fuel-reading.js';
@@ -57,7 +61,7 @@ import type { Vessel } from '../vessels/vessel.js';
 import type { TelemetryStatus } from './dto/status.dto.js';
 import type { FuelSummary } from './dto/summary.dto.js';
 import type { TelemetryVessel } from './dto/telemetry-vessel.dto.js';
-import type { IngestOutcome } from './reading.js';
+import type { IngestOutcome, NewReading } from './reading.js';
 import { ReadingIngestService } from './reading-ingest.service.js';
 import { ReadingsRepository, type SeriesPoint } from './readings.repository.js';
 
@@ -94,6 +98,7 @@ interface Attribution {
  */
 @Injectable()
 export class ReadingsService {
+  private readonly logger = new Logger(ReadingsService.name);
   private readonly limits: ReadingLimits;
 
   constructor(
@@ -110,13 +115,17 @@ export class ReadingsService {
 
   /**
    * Validates, attributes and stores a batch posted over REST; everything
-   * is checked before anything is stored (all or nothing).
+   * is checked before anything is stored (all or nothing). After the commit
+   * the readings are published and, for users, the audit records written,
+   * concurrently: while NATS stalls the request waits at most
+   * `TELEMETRY_PUBLISH_TIMEOUT_MS` for both.
    *
    * @throws {ValidationFailedError} `400` with `<index>.<field>` errors for implausible readings.
    * @throws {DeviceInactiveError} `403` for the key of an inactive device.
    * @throws {DeviceVesselMismatchError} `403` when a device key reports another vessel.
    * @throws {VesselNotFoundError} `404` for MMSIs that are not vessels of the fleet.
    * @throws {VesselAccessDeniedError} `403` for vessels of another organization.
+   * @throws {ReadingConflictError} `409` when a vessel has a different reading at one of the times.
    */
   async ingest(
     readings: readonly FuelReadingInput[],
@@ -144,20 +153,34 @@ export class ReadingsService {
       readings.map((reading) => reading.mmsi),
       principal,
     );
-    const outcome = await this.ingestion.ingest({ readings, ...attribution });
+    const outcome = await this.ingestion.store(
+      { readings, ...attribution },
+      'reject',
+    );
+    if (outcome.rejected) {
+      throw new ReadingConflictError(conflictsOf(readings, outcome.conflicts));
+    }
 
     if (attribution.deviceId !== null)
       await this.devices.markSeen(attribution.deviceId, now);
-    if (principal.kind === 'user') {
-      await this.auditManualEntry(
-        readings,
-        vessels,
-        attribution.source,
-        principal,
-        request,
-      );
-    }
-    return outcome;
+    const [published] = await Promise.all([
+      this.ingestion.publish(outcome.stored),
+      principal.kind === 'user'
+        ? this.auditManualEntry(
+            readings,
+            vessels,
+            attribution.source,
+            principal,
+            request,
+          )
+        : undefined,
+    ]);
+    return {
+      received: outcome.received,
+      accepted: outcome.stored.length,
+      duplicates: outcome.duplicates,
+      published,
+    };
   }
 
   /** One page of a vessel's readings or bucket sums, ascending in time. */
@@ -294,7 +317,13 @@ export class ReadingsService {
     return { source: 'device', deviceId: device.id };
   }
 
-  /** One audit record per vessel for readings entered by a user. */
+  /**
+   * One audit record per vessel for readings entered by a user, published
+   * concurrently. Waits at most `TELEMETRY_PUBLISH_TIMEOUT_MS` (the kit's
+   * audit publish has its own, longer JetStream timeout): records still
+   * pending then complete in the background, and failures are counted in
+   * `aisits_audit_failures_total` by the kit (audit is best effort).
+   */
   private async auditManualEntry(
     readings: readonly FuelReadingInput[],
     vessels: ReadonlyMap<number, Vessel>,
@@ -305,19 +334,44 @@ export class ReadingsService {
     const counts = new Map<number, number>();
     for (const reading of readings)
       counts.set(reading.mmsi, (counts.get(reading.mmsi) ?? 0) + 1);
-    for (const [mmsi, count] of counts) {
-      const vessel = vessels.get(mmsi);
-      await this.audit.record(
-        {
-          action: 'fuel_reading.create',
-          targetType: 'vessel',
-          targetId: vessel?.vesselId ?? null,
-          orgId: vessel?.orgId ?? null,
-          meta: { mmsi, readings: count, source },
-        },
-        principal,
-        request,
+    const records = Promise.all(
+      [...counts].map(([mmsi, count]) => {
+        const vessel = vessels.get(mmsi);
+        return this.audit.record(
+          {
+            action: 'fuel_reading.create',
+            targetType: 'vessel',
+            targetId: vessel?.vesselId ?? null,
+            orgId: vessel?.orgId ?? null,
+            meta: { mmsi, readings: count, source },
+          },
+          principal,
+          request,
+        );
+      }),
+    );
+    const timeoutMs = this.config.TELEMETRY_PUBLISH_TIMEOUT_MS;
+    if (!(await settledWithin(records, timeoutMs))) {
+      this.logger.warn(
+        { vessels: counts.size },
+        `Audit records of the readings still pending after ${timeoutMs} ms; answering without waiting for them`,
       );
     }
   }
+}
+
+/**
+ * The request indexes of the conflicting readings: every reading of the
+ * request with a conflicting key (exact repeats of a key share its fate).
+ */
+function conflictsOf(
+  readings: readonly FuelReadingInput[],
+  conflicts: readonly NewReading[],
+): ReadingConflict[] {
+  const keys = new Set(conflicts.map(readingKey));
+  return readings.flatMap((reading, index) =>
+    keys.has(readingKey(reading))
+      ? [{ index, mmsi: reading.mmsi, time: reading.time }]
+      : [],
+  );
 }

@@ -1,3 +1,6 @@
+import { fileURLToPath } from 'node:url';
+
+import { runMigrations } from '@darmawanweb/ais-its-nest/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { SERVICE } from '../src/service.js';
@@ -78,6 +81,57 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
         },
       ]),
     );
+  });
+
+  it('converges when the no-transaction migration 0002 is retried after failing halfway', async () => {
+    const recorded = async () =>
+      (
+        await service.pool.query<{ version: number; checksum: string }>(
+          'SELECT version, checksum FROM schema_migrations ORDER BY version',
+        )
+      ).rows;
+    const policies = async () =>
+      (
+        await service.pool.query<{ proc_name: string; target: string }>(
+          `SELECT j.proc_name, coalesce(c.view_name, j.hypertable_name) AS target
+           FROM timescaledb_information.jobs j
+           LEFT JOIN timescaledb_information.continuous_aggregates c
+             ON c.materialization_hypertable_name = j.hypertable_name
+           WHERE j.proc_name IN ('policy_retention', 'policy_refresh_continuous_aggregate')
+             AND coalesce(c.view_schema, j.hypertable_schema) = 'telemetry'
+           ORDER BY 1, 2`,
+        )
+      ).rows;
+    const before = await recorded();
+    const policiesBefore = await policies();
+
+    // A first deployment that died after the fuel_hourly statements: its
+    // view and policies exist, fuel_daily does not, 0002 is not recorded.
+    await service.pool.query('DELETE FROM schema_migrations WHERE version = 2');
+    await service.pool.query('DROP MATERIALIZED VIEW fuel_daily');
+
+    const report = await runMigrations({
+      pool: service.pool,
+      schema: SERVICE.schema,
+      dir: fileURLToPath(new URL('../migrations', import.meta.url)),
+    });
+
+    expect(report.applied.map((migration) => migration.version)).toEqual([2]);
+    expect(await recorded()).toEqual(before);
+    // fuel_daily and its policy are back, nothing was created twice.
+    expect(await policies()).toEqual(policiesBefore);
+    expect(policiesBefore).toEqual([
+      {
+        proc_name: 'policy_refresh_continuous_aggregate',
+        target: 'fuel_daily',
+      },
+      {
+        proc_name: 'policy_refresh_continuous_aggregate',
+        target: 'fuel_hourly',
+      },
+      { proc_name: 'policy_retention', target: 'fuel_hourly' },
+      { proc_name: 'policy_retention', target: 'fuel_readings' },
+    ]);
   });
 
   it('denies anonymous requests with 401 problem details', async () => {

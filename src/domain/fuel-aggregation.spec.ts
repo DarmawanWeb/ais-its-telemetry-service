@@ -7,6 +7,7 @@ import {
   floorToBucket,
   type FuelTotals,
   planSummaryPieces,
+  roundFuelSum,
   type SummaryPiece,
   totalFuelTon,
 } from './fuel-aggregation.js';
@@ -171,5 +172,35 @@ describe('addTotals / totalFuelTon (telemetry.fuel_reading_usage)', () => {
     // legacy cii.service.ts: Number(fuelAE.toString()) + Number(fuelME.toString())
     expect(totalFuelTon(Number('1.25'), Number('0.75'))).toBe(2);
     expect(totalFuelTon(0.42, 0.05)).toBeCloseTo(0.47, 12);
+  });
+
+  it('reports sums without binary floating-point artifacts', () => {
+    expect(0.1 + 0.2).not.toBe(0.3);
+    expect(totalFuelTon(0.1, 0.2)).toBe(0.3);
+    expect(totalFuelTon(0.42, 0.05)).toBe(0.47);
+    const tenths = { ...EMPTY_TOTALS, readings: 1, fuelMeTon: 0.1 };
+    expect(addTotals(tenths, { ...tenths, fuelMeTon: 0.2 }).fuelMeTon).toBe(
+      0.3,
+    );
+  });
+});
+
+describe('roundFuelSum', () => {
+  it('rounds to 1 mg (9 decimals of a tonne) and keeps exact values', () => {
+    expect(roundFuelSum(0.30000000000000004)).toBe(0.3);
+    expect(roundFuelSum(15.400000000000002)).toBe(15.4);
+    expect(roundFuelSum(182_500.123456789)).toBe(182_500.123456789);
+    expect(roundFuelSum(1.5)).toBe(1.5);
+    expect(roundFuelSum(0)).toBe(0);
+    expect(roundFuelSum(4e-10)).toBe(0);
+    expect(roundFuelSum(6e-10)).toBe(1e-9);
+  });
+
+  it('leaves values unchanged that cannot be scaled exactly', () => {
+    expect(roundFuelSum(1e7 + 0.1)).toBe(1e7 + 0.1);
+    expect(roundFuelSum(Number.POSITIVE_INFINITY)).toBe(
+      Number.POSITIVE_INFINITY,
+    );
+    expect(roundFuelSum(Number.NaN)).toBeNaN();
   });
 });

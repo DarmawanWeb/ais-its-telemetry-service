@@ -24,12 +24,33 @@ export interface IngestBatch {
   readonly deviceId: string | null;
 }
 
+/**
+ * What happens to readings whose `(mmsi, time)` holds a different reading
+ * already: `reject` refuses the batch (REST answers `409 READING_CONFLICT`,
+ * the client can correct and resend), `skip` stores the rest of it (MQTT:
+ * fire and forget, rejecting would drop the device's other readings).
+ */
+export type ConflictPolicy = 'reject' | 'skip';
+
+/** What storing a batch did (before publication). */
+export interface StoreOutcome {
+  readonly received: number;
+  /** Readings stored by this batch. */
+  readonly stored: readonly StoredReading[];
+  /** Readings repeated in the batch or stored already with the same values and device. */
+  readonly duplicates: number;
+  /** Readings not stored: their key holds a different reading (values or device). */
+  readonly conflicts: readonly NewReading[];
+  /** Policy `reject` found conflicts: the batch was refused. */
+  readonly rejected: boolean;
+}
+
 /** What happened to a batch. */
 export interface IngestOutcome {
   readonly received: number;
   /** Newly stored readings. */
   readonly accepted: number;
-  /** Readings whose `(mmsi, time)` was stored already or repeated in the batch. */
+  /** Readings repeated in the batch or stored already with the same values and device. */
   readonly duplicates: number;
   /** Accepted readings already stored in the FUEL stream; the rest is relayed. */
   readonly published: number;

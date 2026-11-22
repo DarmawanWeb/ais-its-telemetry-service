@@ -3,7 +3,6 @@ import { Transform } from 'class-transformer';
 import {
   IsIn,
   IsInt,
-  IsOptional,
   IsString,
   IsUUID,
   Length,
@@ -20,28 +19,46 @@ import {
 } from '../device.js';
 import { trimString } from './create-device.dto.js';
 
-/** `PATCH /telemetry/devices/:id`: absent fields are kept, `null` clears an optional one. */
+/**
+ * Validates a field only when it is present: unlike `@IsOptional()`, which
+ * also skips `null`, a `null` then fails the field's validators (`400`), so
+ * it can never reach a NOT NULL column.
+ */
+const IfPresent = () =>
+  ValidateIf((_object: object, value: unknown) => value !== undefined);
+
+/** Validates a field unless it is absent or `null` (the nullable fields: `null` clears them). */
+const IfPresentAndNotNull = () =>
+  ValidateIf(
+    (_object: object, value: unknown) => value !== undefined && value !== null,
+  );
+
+/**
+ * `PATCH /telemetry/devices/:id`: absent fields are kept, `null` clears
+ * `apiKeyId` / `serialNumber`; `mmsi`, `name`, `kind` and `status` cannot
+ * be `null`.
+ */
 export class UpdateDeviceDto {
   @ApiPropertyOptional({
     description: 'Move the device to another vessel of the same organization',
     minimum: 100_000_000,
     maximum: 999_999_999,
   })
-  @IsOptional()
+  @IfPresent()
   @IsInt()
   @Min(100_000_000)
   @Max(999_999_999)
   readonly mmsi?: number;
 
   @ApiPropertyOptional({ minLength: 1, maxLength: 120 })
-  @IsOptional()
+  @IfPresent()
   @Transform(trimString)
   @IsString()
   @Length(1, 120)
   readonly name?: string;
 
   @ApiPropertyOptional({ enum: DEVICE_KINDS })
-  @IsOptional()
+  @IfPresent()
   @IsIn(DEVICE_KINDS)
   readonly kind?: DeviceKind;
 
@@ -52,12 +69,12 @@ export class UpdateDeviceDto {
     description:
       'API key of an http device; `null` unlinks it (required for http devices)',
   })
-  @ValidateIf((_object, value) => value !== undefined && value !== null)
+  @IfPresentAndNotNull()
   @IsUUID()
   readonly apiKeyId?: string | null;
 
   @ApiPropertyOptional({ enum: DEVICE_STATUSES })
-  @IsOptional()
+  @IfPresent()
   @IsIn(DEVICE_STATUSES)
   readonly status?: DeviceStatus;
 
@@ -68,7 +85,7 @@ export class UpdateDeviceDto {
     maxLength: 120,
   })
   @Transform(trimString)
-  @ValidateIf((_object, value) => value !== undefined && value !== null)
+  @IfPresentAndNotNull()
   @IsString()
   @Length(1, 120)
   readonly serialNumber?: string | null;

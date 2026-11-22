@@ -7,9 +7,10 @@ const LAG_BUCKETS_SECONDS = [1, 5, 15, 60, 300, 900, 3600, 21_600, 86_400];
 
 /**
  * Domain metrics of the service (spec §10, prefix `aisits_`):
- * - `aisits_telemetry_readings_total{source,outcome}` — `accepted`, `duplicate`, `rejected`;
+ * - `aisits_telemetry_readings_total{source,outcome}` — `accepted`, `duplicate`,
+ *   `conflict` (a different reading is stored at that vessel and time), `rejected` (MQTT);
  * - `aisits_telemetry_device_messages_total{outcome}` — MQTT device messages
- *   (`accepted`, `duplicate`, `invalid_subject`, `invalid_json`, `invalid_payload`,
+ *   (`accepted`, `duplicate`, `conflict`, `invalid_subject`, `invalid_json`, `invalid_payload`,
  *   `unknown_device`, `inactive_device`, `transport_mismatch`, `vessel_not_found`,
  *   `vessel_mismatch`, `error`);
  * - `aisits_telemetry_reading_lag_seconds{source}` — storage time minus reading time;

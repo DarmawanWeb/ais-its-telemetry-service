@@ -111,6 +111,61 @@ export class DeviceApiKeyTakenError extends ConflictError {
   }
 }
 
+/** A reading of a request that conflicts with a stored reading. */
+export interface ReadingConflict {
+  /** Index of the reading in the request body. */
+  readonly index: number;
+  readonly mmsi: number;
+  readonly time: Date;
+}
+
+/**
+ * `409 READING_CONFLICT`: the vessel has a different reading at that time
+ * already (other amounts or period, or reported by another device).
+ * Readings are immutable and keyed by `(mmsi, time)`, so nothing of the
+ * request was stored; `errors` names each conflicting reading as
+ * `<index>.time`. The stored reading is not disclosed (ingest-only API keys
+ * cannot read telemetry).
+ */
+export class ReadingConflictError extends DomainError {
+  override readonly name = 'ReadingConflictError';
+
+  constructor(conflicts: readonly ReadingConflict[]) {
+    super('READING_CONFLICT', {
+      status: 409,
+      title: 'Reading conflict',
+      detail:
+        conflicts.length === 1
+          ? 'A different reading of the vessel is stored at that time already; readings are immutable'
+          : `${conflicts.length} readings conflict with different readings stored at the same vessel and time; readings are immutable`,
+      errors: conflicts.map((conflict) => ({
+        field: `${conflict.index}.time`,
+        message: `MMSI ${conflict.mmsi} has a different reading at ${conflict.time.toISOString()} already`,
+        code: 'conflict',
+      })),
+    });
+  }
+}
+
+/**
+ * `409 DEVICE_CREDENTIAL_CONFLICT`: the kind and the API key of a device no
+ * longer fit together after a concurrent change (`devices_kind_api_key_check`
+ * refused the update that was validated against an older state).
+ */
+export class DeviceCredentialConflictError extends DomainError {
+  override readonly name = 'DeviceCredentialConflictError';
+
+  constructor(cause: unknown) {
+    super('DEVICE_CREDENTIAL_CONFLICT', {
+      status: 409,
+      title: 'Device credential conflict',
+      detail:
+        'The device was changed concurrently and its kind no longer matches its API key; reload it and retry',
+      cause,
+    });
+  }
+}
+
 /** `422 VESSEL_WITHOUT_ORGANIZATION`: devices need a vessel owned by an organization. */
 export class VesselWithoutOrganizationError extends DomainError {
   override readonly name = 'VesselWithoutOrganizationError';

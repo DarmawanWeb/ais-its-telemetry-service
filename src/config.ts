@@ -43,7 +43,11 @@ export const configSchema = defineConfig({
   TELEMETRY_MAX_FUEL_AE_TON: envTonnes(100_000).default(100),
   /** Longest measured period (`time − periodStart`) of one reading, hours. */
   TELEMETRY_MAX_PERIOD_H: envInteger(1, 744).default(24),
-  /** JetStream ack timeout of one `fuel.reading.recorded.v1` publish, ms. */
+  /**
+   * JetStream ack timeout of one `fuel.reading.recorded.v1` publish, ms; also
+   * the longest wait for the audit records of user entries (published
+   * concurrently), so a request waits at most this long after the commit.
+   */
   TELEMETRY_PUBLISH_TIMEOUT_MS: envInteger(100, 60_000).default(5000),
   /** Poll interval of the publication relay, ms (`0` disables the relay). */
   TELEMETRY_RELAY_INTERVAL_MS: envInteger(0, 600_000).default(5000),

@@ -30,7 +30,7 @@ export class IngestResultDto implements IngestOutcome {
 
   @ApiProperty({
     description:
-      'Readings whose (mmsi, time) was stored already or repeated in the request (ignored, idempotent)',
+      'Exact repeats (same period, amounts and device) of stored readings or within the request (ignored, idempotent)',
     example: 1,
   })
   readonly duplicates: number;

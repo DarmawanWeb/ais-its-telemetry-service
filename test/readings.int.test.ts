@@ -2,6 +2,7 @@ import { EVENT_TYPES, subjects } from '@darmawanweb/ais-its-contracts/events';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { readFuelEvents } from './support/fuel-events.js';
+import { metricValue } from './support/metrics.js';
 import {
   newOrgId,
   startTestService,
@@ -18,8 +19,8 @@ describe('fuel readings over REST', () => {
   let service: TestService;
   const orgA = newOrgId();
   const orgB = newOrgId();
-  const [vesselA1, vesselA2, vesselB1, unknownVessel, queryVessel] =
-    uniqueMmsis(5) as [number, number, number, number, number];
+  const [vesselA1, vesselA2, vesselB1, unknownVessel, queryVessel, liveVessel] =
+    uniqueMmsis(6) as [number, number, number, number, number, number];
   let keyA: TestApiKey;
   const now = Date.now();
   const minutesAgo = (minutes: number) =>
@@ -59,6 +60,11 @@ describe('fuel readings over REST', () => {
       mmsi: queryVessel,
       orgId: orgA,
       name: 'KM Query',
+    });
+    await service.publishVessel({
+      mmsi: liveVessel,
+      orgId: orgA,
+      name: 'KM Live',
     });
   });
 
@@ -143,7 +149,7 @@ describe('fuel readings over REST', () => {
       expect(response.json()).toMatchObject({ received: 1, accepted: 1 });
     });
 
-    it('is idempotent by (mmsi, time): stored and repeated readings count as duplicates', async () => {
+    it('is idempotent by (mmsi, time): exact repeats count as duplicates, different readings conflict', async () => {
       const reading = {
         mmsi: vesselA2,
         time: minutesAgo(30),
@@ -157,21 +163,50 @@ describe('fuel readings over REST', () => {
         accepted: 1,
         duplicates: 1,
       });
-      expect(
-        (
-          await post([reading, { ...reading, fuelMeTon: 9 }], keyA.headers)
-        ).json(),
-      ).toEqual({
+      expect((await post([reading, reading], keyA.headers)).json()).toEqual({
         received: 2,
         accepted: 0,
         duplicates: 2,
         published: 0,
       });
-      const { rows } = await service.pool.query<{ fuel_me_ton: number }>(
-        'SELECT fuel_me_ton FROM fuel_readings WHERE mmsi = $1 AND time = $2',
-        [vesselA2, reading.time],
+
+      // Another value at a stored key is refused, never dropped as a "duplicate".
+      const later = {
+        mmsi: vesselA2,
+        time: minutesAgo(29),
+        fuelMeTon: 1,
+        fuelAeTon: 0.1,
+      };
+      const conflict = await post(
+        [later, { ...reading, fuelMeTon: 9 }],
+        keyA.headers,
       );
-      expect(rows).toEqual([{ fuel_me_ton: 2 }]);
+      expect(conflict.statusCode).toBe(409);
+      expect(conflict.headers['content-type']).toContain(
+        'application/problem+json',
+      );
+      expect(conflict.json()).toMatchObject({
+        code: 'READING_CONFLICT',
+        status: 409,
+        errors: [{ field: '1.time', code: 'conflict' }],
+      });
+      // All or nothing: the other reading of the request was not stored either.
+      const stored = await service.pool.query<{ fuel_me_ton: number }>(
+        'SELECT fuel_me_ton FROM fuel_readings WHERE mmsi = $1 AND time = ANY($2::timestamptz[]) ORDER BY time',
+        [vesselA2, [reading.time, later.time]],
+      );
+      expect(stored.rows).toEqual([{ fuel_me_ton: 2 }]);
+
+      // Two different readings of one key in the same request are invalid.
+      const repeated = await post(
+        [later, { ...later, fuelAeTon: 0.5 }],
+        keyA.headers,
+      );
+      expect(repeated.statusCode).toBe(400);
+      expect(repeated.json()).toMatchObject({
+        code: 'VALIDATION_FAILED',
+        errors: [{ field: '1.time', code: 'conflicting_repeat' }],
+      });
       expect(await readFuelEvents(service.app, vesselA2, 3, 1500)).toHaveLength(
         2,
       );
@@ -458,6 +493,98 @@ describe('fuel readings over REST', () => {
     });
   });
 
+  describe('two devices on one vessel', () => {
+    it('refuses the second reading of the same instant with 409 READING_CONFLICT instead of dropping it', async () => {
+      const admin = await service.authorization({
+        roles: ['org_admin'],
+        orgId: orgA,
+      });
+      const register = async (name: string) => {
+        const key = service.apiKey(orgA);
+        const response = await service.app.inject({
+          method: 'POST',
+          url: '/api/v2/telemetry/devices',
+          headers: admin,
+          payload: { mmsi: vesselA2, name, kind: 'http', apiKeyId: key.keyId },
+        });
+        expect(response.statusCode, response.body).toBe(201);
+        return { key, id: response.json<{ id: string }>().id };
+      };
+      const mainEngine = await register('ME meter (two devices)');
+      const auxEngine = await register('AE meter (two devices)');
+      // Aligned interval boundaries: both meters report the same instant.
+      const time = minutesAgo(40);
+      const conflictsBefore = await metricValue(
+        service.app,
+        'aisits_telemetry_readings_total',
+        { source: 'device', outcome: 'conflict' },
+      );
+
+      const first = await post(
+        { mmsi: vesselA2, time, fuelMeTon: 1.5, fuelAeTon: 0 },
+        mainEngine.key.headers,
+      );
+      expect(first.json()).toMatchObject({ accepted: 1, duplicates: 0 });
+
+      const second = await post(
+        { mmsi: vesselA2, time, fuelMeTon: 0, fuelAeTon: 0.3 },
+        auxEngine.key.headers,
+      );
+      expect(second.statusCode).toBe(409);
+      expect(second.json()).toMatchObject({
+        code: 'READING_CONFLICT',
+        errors: [{ field: '0.time', code: 'conflict' }],
+      });
+      // Equal amounts from another meter are not a retry of the first either.
+      expect(
+        (
+          await post(
+            { mmsi: vesselA2, time, fuelMeTon: 1.5, fuelAeTon: 0 },
+            auxEngine.key.headers,
+          )
+        ).statusCode,
+      ).toBe(409);
+      // The first meter's retry is still an idempotent duplicate.
+      expect(
+        (
+          await post(
+            { mmsi: vesselA2, time, fuelMeTon: 1.5, fuelAeTon: 0 },
+            mainEngine.key.headers,
+          )
+        ).json(),
+      ).toMatchObject({ accepted: 0, duplicates: 1 });
+
+      const { rows } = await service.pool.query<{
+        device_id: string;
+        fuel_me_ton: number;
+        fuel_ae_ton: number;
+      }>(
+        'SELECT device_id, fuel_me_ton, fuel_ae_ton FROM fuel_readings WHERE mmsi = $1 AND time = $2',
+        [vesselA2, time],
+      );
+      expect(rows).toEqual([
+        { device_id: mainEngine.id, fuel_me_ton: 1.5, fuel_ae_ton: 0 },
+      ]);
+      expect(
+        await metricValue(service.app, 'aisits_telemetry_readings_total', {
+          source: 'device',
+          outcome: 'conflict',
+        }),
+      ).toBe(conflictsBefore + 2);
+
+      // Distinct instants of the two meters are both stored.
+      const offset = new Date(new Date(time).getTime() + 1000).toISOString();
+      expect(
+        (
+          await post(
+            { mmsi: vesselA2, time: offset, fuelMeTon: 0, fuelAeTon: 0.3 },
+            auxEngine.key.headers,
+          )
+        ).json(),
+      ).toMatchObject({ accepted: 1 });
+    });
+  });
+
   describe('queries (telemetry:read)', () => {
     // A UTC day three days ago: readings at 10:15, 10:45, 11:30 and 00:30 the next day.
     const day = Math.floor((now - 3 * DAY_MS) / DAY_MS) * DAY_MS;
@@ -526,7 +653,7 @@ describe('fuel readings over REST', () => {
       expect(foreignCursor.statusCode).toBe(400);
     });
 
-    it('serves hourly and daily sums from the continuous aggregates, before and after a refresh', async () => {
+    it('serves hourly and daily sums from the continuous aggregates, in real time and after a refresh', async () => {
       const range = `from=${at(0)}&to=${at(48)}`;
       const expectedHourly = [
         { time: at(10), fuelMeTon: 3, readings: 2 },
@@ -554,10 +681,41 @@ describe('fuel readings over REST', () => {
             readings: count,
           }));
 
-      // Real-time aggregation (nothing materialized for these buckets yet) …
-      expect(await series('1h')).toEqual(expectedHourly);
-      expect(await series('1d')).toEqual(expectedDaily);
-      // … and the materialized aggregates give the same answer.
+      // Real-time aggregation: the last hours are never materialized by the
+      // policies (end_offset 1 h / 1 day), so a fresh reading is summed at once.
+      const liveTime = new Date(Date.now() - 60_000);
+      expect(
+        (
+          await post(
+            {
+              mmsi: liveVessel,
+              time: liveTime.toISOString(),
+              fuelMeTon: 0.1,
+              fuelAeTon: 0.2,
+            },
+            keyA.headers,
+          )
+        ).statusCode,
+      ).toBe(202);
+      const liveHour = new Date(
+        Math.floor(liveTime.getTime() / HOUR_MS) * HOUR_MS,
+      );
+      const live = await get(
+        `${liveVessel}/readings?bucket=1h&from=${new Date(liveHour.getTime() - HOUR_MS).toISOString()}`,
+      );
+      expect(live.json<{ data: unknown[] }>().data).toEqual([
+        expect.objectContaining({
+          time: liveHour.toISOString(),
+          fuelMeTon: 0.1,
+          fuelAeTon: 0.2,
+          totalFuelTon: 0.3,
+          readings: 1,
+        }),
+      ]);
+
+      // Readings three days old lie below the materialization watermark once
+      // any refresh policy ran (other test files run them): they are folded in
+      // by the next refresh, as the policy jobs do.
       await service.pool.query(
         `CALL refresh_continuous_aggregate('fuel_hourly', NULL, NULL)`,
       );
@@ -626,7 +784,7 @@ describe('fuel readings over REST', () => {
       }>();
       expect(response.statusCode).toBe(200);
       expect(body.data.map((vessel) => vessel.mmsi).sort()).toEqual(
-        [vesselA1, vesselA2, queryVessel].sort(),
+        [vesselA1, vesselA2, queryVessel, liveVessel].sort(),
       );
       expect(
         body.data.find((vessel) => vessel.mmsi === vesselA1),

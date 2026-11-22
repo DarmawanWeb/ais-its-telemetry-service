@@ -122,8 +122,8 @@ export const EMPTY_TOTALS: FuelTotals = Object.freeze({
 export function addTotals(a: FuelTotals, b: FuelTotals): FuelTotals {
   return {
     readings: a.readings + b.readings,
-    fuelMeTon: a.fuelMeTon + b.fuelMeTon,
-    fuelAeTon: a.fuelAeTon + b.fuelAeTon,
+    fuelMeTon: roundFuelSum(a.fuelMeTon + b.fuelMeTon),
+    fuelAeTon: roundFuelSum(a.fuelAeTon + b.fuelAeTon),
     firstReadingAt: earliest(a.firstReadingAt, b.firstReadingAt),
     lastReadingAt: latest(a.lastReadingAt, b.lastReadingAt),
   };
@@ -137,7 +137,27 @@ export function addTotals(a: FuelTotals, b: FuelTotals): FuelTotals {
  * @see ../../../../docs/METHODOLOGY.md#telemetry.fuel_reading_usage
  */
 export function totalFuelTon(fuelMeTon: number, fuelAeTon: number): number {
-  return fuelMeTon + fuelAeTon;
+  return roundFuelSum(fuelMeTon + fuelAeTon);
+}
+
+/** Computed fuel sums are reported to this many decimals of a tonne (1 mg, far below any meter's resolution). */
+export const FUEL_SUM_DECIMALS = 9;
+
+const FUEL_SUM_SCALE = 10 ** FUEL_SUM_DECIMALS;
+
+/**
+ * Rounds a computed sum of fuel amounts (t) to {@link FUEL_SUM_DECIMALS}
+ * decimals, so that binary floating-point artifacts of the addition
+ * (`0.1 + 0.2` = `0.30000000000000004`) do not reach clients; the readings
+ * themselves are returned as stored. Values too large to scale exactly
+ * (> ~9·10⁶ t) and non-finite values are returned unchanged.
+ */
+export function roundFuelSum(value: number): number {
+  const scaled = value * FUEL_SUM_SCALE;
+  if (!Number.isFinite(scaled) || Math.abs(scaled) > Number.MAX_SAFE_INTEGER)
+    return value;
+  // Dividing the integer by the exact scale gives the double nearest to the decimal.
+  return Math.round(scaled) / FUEL_SUM_SCALE;
 }
 
 function earliest(a: Date | null, b: Date | null): Date | null {

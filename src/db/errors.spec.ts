@@ -1,11 +1,45 @@
 import { describe, expect, it } from 'vitest';
 
-import { isUniqueViolation, PG_UNIQUE_VIOLATION } from './errors.js';
+import {
+  isUniqueViolation,
+  PG_CHECK_VIOLATION,
+  PG_NOT_NULL_VIOLATION,
+  PG_UNIQUE_VIOLATION,
+  pgErrorOf,
+} from './errors.js';
 
 /** A driver error as `pg` throws it. */
-function driverError(code: string, constraint?: string): Error {
-  return Object.assign(new Error('duplicate key value'), { code, constraint });
+function driverError(
+  code: string,
+  constraint?: string,
+  column?: string,
+): Error {
+  return Object.assign(new Error('violation'), { code, constraint, column });
 }
+
+describe('pgErrorOf', () => {
+  it('reads SQLSTATE, constraint and column through wrapping errors', () => {
+    const notNull = new Error('Failed query', {
+      cause: driverError(PG_NOT_NULL_VIOLATION, undefined, 'name'),
+    });
+    expect(pgErrorOf(notNull)).toEqual({
+      code: PG_NOT_NULL_VIOLATION,
+      constraint: undefined,
+      column: 'name',
+    });
+    expect(
+      pgErrorOf(driverError(PG_CHECK_VIOLATION, 'devices_kind_api_key_check')),
+    ).toMatchObject({ constraint: 'devices_kind_api_key_check' });
+  });
+
+  it('is undefined for errors without a SQLSTATE', () => {
+    expect(
+      pgErrorOf(Object.assign(new Error('x'), { code: 'ECONNREFUSED' })),
+    ).toBeUndefined();
+    expect(pgErrorOf(new Error('boom'))).toBeUndefined();
+    expect(pgErrorOf('23505')).toBeUndefined();
+  });
+});
 
 describe('isUniqueViolation', () => {
   it('recognizes a unique violation of the driver', () => {

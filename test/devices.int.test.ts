@@ -325,6 +325,20 @@ describe('device registry /telemetry/devices (device:manage)', () => {
     const unchanged = await request('PATCH', `/${device.id}`, adminA, {});
     expect(unchanged.json<DeviceBody>().name).toBe('AE meter (port)');
 
+    // null only clears the nullable fields; the others answer 400, not 500/404.
+    for (const field of ['name', 'status', 'kind', 'mmsi']) {
+      const cleared = await request('PATCH', `/${device.id}`, adminA, {
+        [field]: null,
+      });
+      expect(cleared.statusCode, `${field}: ${cleared.body}`).toBe(400);
+      expect(cleared.json()).toMatchObject({
+        code: 'VALIDATION_FAILED',
+        errors: expect.arrayContaining([
+          expect.objectContaining({ field }),
+        ]) as unknown,
+      });
+    }
+
     expect((await request('DELETE', `/${device.id}`, adminA)).statusCode).toBe(
       204,
     );

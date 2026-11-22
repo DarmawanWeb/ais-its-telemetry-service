@@ -11,6 +11,9 @@ import {
   uniqueMmsis,
 } from './support/test-service.js';
 
+const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
+
 /**
  * Reliable publication: a reading stored while the FUEL stream cannot take
  * it (here: the stream is deleted, so JetStream has no responder) stays
@@ -144,5 +147,60 @@ describe('publication relay', () => {
     expect(
       events.filter((event) => event.msgId === `${mmsi}:${relayTime}`),
     ).toHaveLength(1);
+  });
+
+  it('marks a relayed reading of a compressed chunk without decompressing the other vessels', async () => {
+    // Five vessels with a day of 15-minute readings in a chunk ~450 days old
+    // (one compressed batch per vessel); one reading was never published.
+    const vessels = uniqueMmsis(5);
+    const [target] = vessels as [number];
+    const day = Math.floor((Date.now() - 450 * DAY_MS) / DAY_MS) * DAY_MS;
+    const unpublished = new Date(day + 12 * HOUR_MS).toISOString();
+    await service.pool.query(
+      `INSERT INTO fuel_readings (time, mmsi, fuel_me_ton, fuel_ae_ton, source, published_at)
+       SELECT t, m, 0.1, 0.01, 'import', CASE WHEN m = $3 AND t = $4 THEN NULL ELSE now() END
+       FROM unnest($1::integer[]) m,
+            generate_series($2::timestamptz, $2::timestamptz + interval '1 day' - interval '15 minutes', interval '15 minutes') t`,
+      [vessels, new Date(day).toISOString(), target, unpublished],
+    );
+    const { rows: chunks } = await service.pool.query<{ chunk: string }>(
+      `SELECT compress_chunk(format('%I.%I', chunk_schema, chunk_name)::regclass)::text AS chunk
+       FROM timescaledb_information.chunks
+       WHERE hypertable_schema = 'telemetry' AND hypertable_name = 'fuel_readings'
+         AND range_start <= $1 AND range_end > $1`,
+      [unpublished],
+    );
+    const chunk = chunks[0]?.chunk ?? '';
+    const uncompressedRows = async () =>
+      Number(
+        (
+          await service.pool.query<{ count: string }>(
+            `SELECT count(*) FROM ONLY ${chunk}`,
+          )
+        ).rows[0]?.count,
+      );
+    expect(await uncompressedRows()).toBe(0);
+
+    // Queued as if its publication had failed a minute ago: the relay takes it.
+    await service.pool.query(
+      `INSERT INTO fuel_readings_unpublished (mmsi, time, received_at) VALUES ($1, $2, now() - interval '1 minute')`,
+      [target, unpublished],
+    );
+    await waitFor(
+      async () =>
+        (
+          await service.pool.query(
+            'SELECT 1 FROM fuel_readings WHERE mmsi = $1 AND time = $2 AND published_at IS NOT NULL',
+            [target, unpublished],
+          )
+        ).rowCount === 1,
+      { timeoutMs: 15_000, message: 'relay did not mark the reading' },
+    );
+
+    // Only the target vessel's batch (96 readings) was decompressed to set
+    // published_at; without the MMSI predicate it would be all five (480).
+    expect(await uncompressedRows()).toBe(96);
+    const [event] = await readFuelEvents(service.app, target, 1);
+    expect(event?.msgId).toBe(`${target}:${unpublished}`);
   });
 });

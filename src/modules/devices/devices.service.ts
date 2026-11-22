@@ -15,18 +15,25 @@ import { Injectable } from '@nestjs/common';
 
 import {
   DeviceApiKeyTakenError,
+  DeviceCredentialConflictError,
   DeviceNameTakenError,
   DeviceNotFoundError,
   VesselAccessDeniedError,
   VesselWithoutOrganizationError,
 } from '../../common/errors.js';
-import { isUniqueViolation } from '../../db/errors.js';
+import {
+  isUniqueViolation,
+  PG_CHECK_VIOLATION,
+  PG_NOT_NULL_VIOLATION,
+  pgErrorOf,
+} from '../../db/errors.js';
 import {
   tenantScopeOf,
   VesselAccessService,
 } from '../vessels/vessel-access.service.js';
 import {
   DEVICE_API_KEY_CONSTRAINT,
+  DEVICE_CREDENTIAL_CONSTRAINT,
   DEVICE_NAME_CONSTRAINT,
   deviceCredentialError,
   type Device,
@@ -72,7 +79,7 @@ export class DevicesService {
     const apiKeyId = input.apiKeyId ?? null;
     assertCredential(input.kind, apiKeyId);
 
-    const device = await this.unique(input.name, apiKeyId, () =>
+    const device = await this.mapConstraintErrors(input.name, apiKeyId, () =>
       this.repository.insert({
         id: newId(),
         orgId,
@@ -148,7 +155,7 @@ export class DevicesService {
       changes.apiKeyId === undefined ? current.apiKeyId : changes.apiKeyId;
     assertCredential(changes.kind ?? current.kind, apiKeyId);
 
-    const device = await this.unique(
+    const device = await this.mapConstraintErrors(
       changes.name ?? current.name,
       apiKeyId,
       () => this.repository.update(id, tenantScopeOf(principal), changes),
@@ -206,8 +213,14 @@ export class DevicesService {
     await this.repository.markSeen(id, at);
   }
 
-  /** Runs a write and maps duplicate names / API keys to `409`. */
-  private async unique<T>(
+  /**
+   * Runs a write and maps constraint violations to domain errors: duplicate
+   * names / API keys `409`; a kind/API-key pair that no longer fits after a
+   * concurrent change (`devices_kind_api_key_check`; the rule was checked
+   * against an older read) `409`; a `null` for a NOT NULL column or another
+   * CHECK the DTOs did not catch `400`, never `500`.
+   */
+  private async mapConstraintErrors<T>(
     name: string,
     apiKeyId: string | null,
     write: () => Promise<T>,
@@ -223,6 +236,28 @@ export class DevicesService {
         isUniqueViolation(error, DEVICE_API_KEY_CONSTRAINT)
       ) {
         throw new DeviceApiKeyTakenError(apiKeyId, error);
+      }
+      const pg = pgErrorOf(error);
+      if (
+        pg?.code === PG_CHECK_VIOLATION &&
+        pg.constraint === DEVICE_CREDENTIAL_CONSTRAINT
+      ) {
+        throw new DeviceCredentialConflictError(error);
+      }
+      if (pg?.code === PG_NOT_NULL_VIOLATION) {
+        const field = pg.column ?? 'body';
+        throw new ValidationFailedError([
+          { field, message: `${field} must not be null`, code: 'required' },
+        ]);
+      }
+      if (pg?.code === PG_CHECK_VIOLATION) {
+        throw new ValidationFailedError([
+          {
+            field: 'body',
+            message: `the device violates ${pg.constraint ?? 'a check constraint'}`,
+            code: 'constraint',
+          },
+        ]);
       }
       throw error;
     }

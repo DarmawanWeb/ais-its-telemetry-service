@@ -75,7 +75,9 @@ export class ReadingsController {
       'All or nothing: every reading is validated (non-negative, ≤ configured maxima, time ≤ now + TELEMETRY_MAX_FUTURE_SKEW_MIN ' +
       'and at most TELEMETRY_MAX_AGE_DAYS old, periodStart before time) and every vessel must belong to the caller’s organization ' +
       'before anything is stored. ' +
-      'Readings are idempotent by (mmsi, time): repeats are counted as duplicates. Stored readings are published as ' +
+      'A vessel has one reading per time: an exact repeat (same period, amounts and device) is an idempotent duplicate; ' +
+      'a different reading at a stored (mmsi, time) — other values, or another device of the vessel — answers ' +
+      '409 READING_CONFLICT and nothing of the request is stored. Stored readings are published as ' +
       'fuel.reading.recorded.v1 after the commit (Nats-Msg-Id <mmsi>:<time>). Error fields are `<index>.<field>`.',
   })
   @ApiBody({

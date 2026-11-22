@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DeviceInactiveError,
   DeviceVesselMismatchError,
+  ReadingConflictError,
   VesselAccessDeniedError,
   VesselNotFoundError,
 } from '../../common/errors.js';
@@ -16,7 +17,7 @@ import type { DevicesService } from '../devices/devices.service.js';
 import type { Vessel } from '../vessels/vessel.js';
 import { VesselAccessService } from '../vessels/vessel-access.service.js';
 import type { VesselsRepository } from '../vessels/vessels.repository.js';
-import type { IngestBatch } from './reading.js';
+import type { IngestBatch, NewReading, StoredReading } from './reading.js';
 import type { ReadingIngestService } from './reading-ingest.service.js';
 import type { ReadingsRepository } from './readings.repository.js';
 import { ReadingsService } from './readings.service.js';
@@ -57,6 +58,16 @@ const reading = (
   fuelAeTon: 0.05,
 });
 
+const stored = (
+  batch: IngestBatch,
+  input: FuelReadingInput,
+): StoredReading => ({
+  ...input,
+  source: batch.source,
+  deviceId: batch.deviceId,
+  receivedAt: NOW,
+});
+
 const user = (roles: UserPrincipal['roles'], orgId: string | null = ORG) =>
   new UserPrincipal({
     id: '0193a0f2-0000-7000-8000-0000000000u1',
@@ -90,7 +101,8 @@ const device = (overrides: Partial<Device> = {}): Device => ({
 });
 
 describe('ReadingsService', () => {
-  const ingest = vi.fn<ReadingIngestService['ingest']>();
+  const store = vi.fn<ReadingIngestService['store']>();
+  const publish = vi.fn<ReadingIngestService['publish']>();
   const deviceOfApiKey = vi.fn<DevicesService['deviceOfApiKey']>();
   const markSeen = vi.fn<DevicesService['markSeen']>();
   const record = vi.fn<AuditService['record']>();
@@ -100,21 +112,23 @@ describe('ReadingsService', () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
-    ingest.mockImplementation((batch: IngestBatch) =>
+    store.mockImplementation((batch: IngestBatch) =>
       Promise.resolve({
         received: batch.readings.length,
-        accepted: batch.readings.length,
+        stored: batch.readings.map((input) => stored(batch, input)),
         duplicates: 0,
-        published: batch.readings.length,
+        conflicts: [],
+        rejected: false,
       }),
     );
+    publish.mockImplementation((readings) => Promise.resolve(readings.length));
     deviceOfApiKey.mockResolvedValue(undefined);
     record.mockResolvedValue(true);
     const findLive = (mmsis: readonly number[]) =>
       Promise.resolve(FLEET.filter((v) => mmsis.includes(v.mmsi)));
     service = new ReadingsService(
       { latest, pieceTotals } as unknown as ReadingsRepository,
-      { ingest } as unknown as ReadingIngestService,
+      { store, publish } as unknown as ReadingIngestService,
       new VesselAccessService({ findLive } as unknown as VesselsRepository),
       { deviceOfApiKey, markSeen } as unknown as DevicesService,
       { record } as unknown as AuditService,
@@ -137,12 +151,16 @@ describe('ReadingsService', () => {
         undefined,
       );
 
-      expect(outcome.accepted).toBe(3);
-      expect(ingest).toHaveBeenCalledWith({
-        readings,
-        source: 'manual',
-        deviceId: null,
+      expect(outcome).toEqual({
+        received: 3,
+        accepted: 3,
+        duplicates: 0,
+        published: 3,
       });
+      expect(store).toHaveBeenCalledWith(
+        { readings, source: 'manual', deviceId: null },
+        'reject',
+      );
       expect(record).toHaveBeenCalledTimes(2);
       expect(record.mock.calls[0]?.[0]).toMatchObject({
         action: 'fuel_reading.create',
@@ -154,7 +172,7 @@ describe('ReadingsService', () => {
 
     it('lets users label historical imports', async () => {
       await service.ingest([reading(525005223)], user(['org_admin']), 'import');
-      expect(ingest.mock.calls[0]?.[0].source).toBe('import');
+      expect(store.mock.calls[0]?.[0].source).toBe('import');
     });
 
     it('rejects implausible readings with <index>.<field> errors before anything else', async () => {
@@ -174,12 +192,12 @@ describe('ReadingsService', () => {
           code: 'negative',
         },
       ]);
-      expect(ingest).not.toHaveBeenCalled();
+      expect(store).not.toHaveBeenCalled();
     });
 
     it('attributes readings of an API key without device to source api', async () => {
       await service.ingest([reading(525005223)], apiKey, undefined);
-      expect(ingest.mock.calls[0]?.[0]).toMatchObject({
+      expect(store.mock.calls[0]?.[0]).toMatchObject({
         source: 'api',
         deviceId: null,
       });
@@ -189,7 +207,7 @@ describe('ReadingsService', () => {
     it('attributes readings of a device key to the device and marks it seen', async () => {
       deviceOfApiKey.mockResolvedValue(device());
       await service.ingest([reading(525005223)], apiKey, undefined);
-      expect(ingest.mock.calls[0]?.[0]).toMatchObject({
+      expect(store.mock.calls[0]?.[0]).toMatchObject({
         source: 'device',
         deviceId: device().id,
       });
@@ -216,7 +234,7 @@ describe('ReadingsService', () => {
       await expect(
         service.ingest([reading(525005224)], apiKey, undefined),
       ).rejects.toBeInstanceOf(DeviceVesselMismatchError);
-      expect(ingest).not.toHaveBeenCalled();
+      expect(store).not.toHaveBeenCalled();
     });
 
     it('refuses a source chosen by an API key', async () => {
@@ -250,7 +268,7 @@ describe('ReadingsService', () => {
         code: 'FORBIDDEN',
         status: 403,
       });
-      expect(ingest).not.toHaveBeenCalled();
+      expect(store).not.toHaveBeenCalled();
     });
 
     it('lets platform administrators write telemetry of any organization', async () => {
@@ -259,7 +277,89 @@ describe('ReadingsService', () => {
         user(['super_admin'], null),
         undefined,
       );
-      expect(ingest).toHaveBeenCalledOnce();
+      expect(store).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('ingest: conflicts and the post-commit wait', () => {
+    it('answers 409 READING_CONFLICT with the index of every conflicting reading', async () => {
+      const taken = reading(525005223, 5);
+      const readings = [reading(525005223), taken, reading(525005224, 5)];
+      const conflicting: NewReading = {
+        ...taken,
+        source: 'device',
+        deviceId: null,
+      };
+      store.mockResolvedValue({
+        received: 3,
+        stored: [],
+        duplicates: 0,
+        conflicts: [conflicting],
+        rejected: true,
+      });
+
+      const error = await service
+        .ingest(readings, apiKey, undefined)
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ReadingConflictError);
+      expect(error).toMatchObject({
+        code: 'READING_CONFLICT',
+        status: 409,
+        errors: [
+          {
+            field: '1.time',
+            message: `MMSI 525005223 has a different reading at ${taken.time.toISOString()} already`,
+            code: 'conflict',
+          },
+        ],
+      });
+      expect(publish).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('writes the audit records concurrently with the publication and waits at most TELEMETRY_PUBLISH_TIMEOUT_MS', async () => {
+      vi.useFakeTimers();
+      try {
+        // NATS stalls: neither the readings nor the audit records are acknowledged.
+        const stalled = () => new Promise<never>(() => undefined);
+        record.mockImplementation(stalled);
+        // The publisher gives up after its JetStream timeout.
+        publish.mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              setTimeout(() => {
+                resolve(0);
+              }, config.TELEMETRY_PUBLISH_TIMEOUT_MS);
+            }),
+        );
+        let answered = false;
+        const pending = service
+          .ingest(
+            [reading(525005223), reading(525005224), reading(525005223, 1)],
+            user(['fleet_manager']),
+            undefined,
+          )
+          .then((outcome) => {
+            answered = true;
+            return outcome;
+          });
+
+        await vi.advanceTimersByTimeAsync(
+          config.TELEMETRY_PUBLISH_TIMEOUT_MS - 1,
+        );
+        expect(answered).toBe(false);
+        // Both vessels' records were started at once, not one after the other.
+        expect(record).toHaveBeenCalledTimes(2);
+
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(pending).resolves.toMatchObject({
+          accepted: 3,
+          published: 0,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

@@ -17,6 +17,7 @@ import { TelemetryMetrics } from './telemetry.metrics.js';
 export type DeviceMessageOutcome =
   | 'accepted'
   | 'duplicate'
+  | 'conflict'
   | 'invalid_subject'
   | 'invalid_json'
   | 'invalid_payload'
@@ -36,7 +37,10 @@ const STORE_RETRY_BASE_MS = 250;
  * the device must be registered, active and of kind `mqtt`; its vessel (the
  * MMSI of the device record) must still belong to the device's organization.
  * Rejected messages are counted by outcome and never stored. Accepted ones
- * enter the shared pipeline with source `mqtt`.
+ * enter the shared pipeline with source `mqtt`; readings whose key holds a
+ * different reading already (e.g. another meter of the vessel reported the
+ * same instant) are left out and the message counts as `conflict`, while
+ * the device's other readings are stored (no one could resend them).
  */
 @Injectable()
 export class DeviceIngestService {
@@ -157,9 +161,24 @@ export class DeviceIngestService {
     }
 
     const result = await withRetries(() =>
-      this.ingestion.ingest({ readings, source: 'mqtt', deviceId: device.id }),
+      this.ingestion.ingest(
+        { readings, source: 'mqtt', deviceId: device.id },
+        'skip',
+      ),
     );
     await this.devices.markSeen(device.id, now);
+    if (result.conflicts > 0) {
+      this.logger.warn(
+        {
+          deviceId,
+          mmsi: device.mmsi,
+          conflicts: result.conflicts,
+          accepted: result.accepted,
+        },
+        'Device readings conflict with different readings stored for the vessel at the same time; they were not stored',
+      );
+      return 'conflict';
+    }
     return result.accepted > 0 ? 'accepted' : 'duplicate';
   }
 }

@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  type AttributedReading,
   batchViolations,
+  compareWithStored,
   dedupeReadings,
   type FuelReadingInput,
+  groupByStorageWindow,
   readingKey,
   type ReadingLimits,
   readingViolations,
+  repeatViolations,
+  sameMeasurement,
 } from './fuel-reading.js';
 
 const NOW = new Date('2026-11-21T10:00:00.000Z');
@@ -97,17 +102,128 @@ describe('batchViolations', () => {
     const violations = batchViolations(
       [
         reading(),
-        reading({ fuelMeTon: -1 }),
+        reading({ fuelMeTon: -1, time: new Date('2026-11-21T09:10:00Z') }),
         reading({ fuelAeTon: 101, time: new Date('2026-11-22T00:00:00Z') }),
+        reading({ fuelMeTon: 7 }),
       ],
       LIMITS,
       NOW,
     );
-    expect(violations.map((v) => `${v.index}.${v.field}`)).toEqual([
-      '1.fuelMeTon',
-      '2.fuelAeTon',
-      '2.time',
+    expect(violations.map((v) => `${v.index}.${v.field}:${v.code}`)).toEqual([
+      '1.fuelMeTon:negative',
+      '2.fuelAeTon:above_maximum',
+      '2.time:future_time',
+      '3.time:conflicting_repeat',
     ]);
+  });
+});
+
+describe('repeatViolations', () => {
+  it('accepts exact repeats and readings of other vessels or times', () => {
+    expect(
+      repeatViolations([
+        reading(),
+        reading(),
+        reading({ mmsi: 525005224, fuelMeTon: 9 }),
+        reading({ time: new Date('2026-11-21T09:01:00Z'), fuelMeTon: 9 }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it('rejects a repeated (mmsi, time) with other amounts or another period', () => {
+    const violations = repeatViolations([
+      reading(),
+      reading({ fuelAeTon: 0.3 }),
+      reading({ periodStart: new Date('2026-11-21T08:00:00Z') }),
+    ]);
+    expect(violations).toEqual([
+      {
+        index: 1,
+        field: 'time',
+        code: 'conflicting_repeat',
+        message:
+          'repeats MMSI 525005223 and time 2026-11-21T09:00:00.000Z of reading 0 with different values',
+      },
+      expect.objectContaining({ index: 2, code: 'conflicting_repeat' }),
+    ]);
+  });
+});
+
+describe('sameMeasurement', () => {
+  it('compares the period and both amounts exactly', () => {
+    const period = new Date('2026-11-21T08:00:00Z');
+    expect(sameMeasurement(reading(), reading())).toBe(true);
+    expect(
+      sameMeasurement(
+        reading({ periodStart: period }),
+        reading({ periodStart: new Date(period.getTime()) }),
+      ),
+    ).toBe(true);
+    expect(sameMeasurement(reading(), reading({ periodStart: period }))).toBe(
+      false,
+    );
+    expect(sameMeasurement(reading(), reading({ fuelMeTon: 0.42001 }))).toBe(
+      false,
+    );
+    expect(sameMeasurement(reading(), reading({ fuelAeTon: 0 }))).toBe(false);
+  });
+});
+
+describe('compareWithStored', () => {
+  const attributed = (
+    deviceId: string | null,
+    overrides: Partial<FuelReadingInput> = {},
+  ): AttributedReading => ({ ...reading(overrides), deviceId });
+
+  it('sorts readings into fresh keys, idempotent repeats and conflicts', () => {
+    const stored = [
+      attributed('device-a'),
+      attributed(null, { time: new Date('2026-11-21T09:10:00Z') }),
+    ];
+    const same = attributed('device-a');
+    const fresh = attributed('device-a', {
+      time: new Date('2026-11-21T09:20:00Z'),
+    });
+    const otherAmount = attributed(null, {
+      time: new Date('2026-11-21T09:10:00Z'),
+      fuelMeTon: 1,
+    });
+
+    expect(compareWithStored([same, fresh, otherAmount], stored)).toEqual({
+      fresh: [fresh],
+      duplicates: [same],
+      conflicts: [otherAmount],
+    });
+  });
+
+  it('treats the same instant from another device as a conflict, even with equal amounts', () => {
+    // Two meters of one vessel (e.g. main and auxiliary engine) reporting aligned
+    // interval boundaries: the second must not vanish as a "duplicate".
+    const stored = [attributed('me-meter', { fuelMeTon: 1.5, fuelAeTon: 0 })];
+    const aeMeter = attributed('ae-meter', { fuelMeTon: 0, fuelAeTon: 0.3 });
+    const twin = attributed('twin-meter', { fuelMeTon: 1.5, fuelAeTon: 0 });
+    const manual = attributed(null, { fuelMeTon: 1.5, fuelAeTon: 0 });
+
+    expect(
+      compareWithStored([aeMeter, twin, manual], stored).conflicts,
+    ).toEqual([aeMeter, twin, manual]);
+  });
+});
+
+describe('groupByStorageWindow', () => {
+  it('splits by UTC day in chronological order, keeping the input order within a day', () => {
+    const at = (iso: string) => ({ time: new Date(iso) });
+    const late = at('2026-11-21T23:59:59.999Z');
+    const early = at('2026-11-21T00:00:00.000Z');
+    const nextDay = at('2026-11-22T00:00:00.000Z');
+    const yearsAgo = at('2021-12-01T12:00:00.000Z');
+
+    expect(groupByStorageWindow([nextDay, late, yearsAgo, early])).toEqual([
+      [yearsAgo],
+      [late, early],
+      [nextDay],
+    ]);
+    expect(groupByStorageWindow([])).toEqual([]);
   });
 });
 
@@ -119,6 +235,7 @@ describe('readingKey', () => {
 
 describe('dedupeReadings', () => {
   it('keeps the first reading of each (mmsi, time) in order', () => {
+    // Validated batches repeat a key only with equal values (repeatViolations).
     const first = reading({ fuelMeTon: 1 });
     const repeated = reading({ fuelMeTon: 2 });
     const otherVessel = reading({ mmsi: 525005224 });

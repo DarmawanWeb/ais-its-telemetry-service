@@ -6,8 +6,13 @@
 -- be created inside a transaction block, hence the marker above (statements
 -- run one by one). Real-time aggregation (materialized_only = false) serves
 -- the buckets not materialized yet, so the newest readings are always included.
+--
+-- Every statement is idempotent (IF NOT EXISTS, if_not_exists => true): the
+-- migrator records a no-transaction migration only after all its statements
+-- succeeded, so a run that failed halfway (connection drop, timeout, restart)
+-- converges when it is retried instead of failing on "already exists".
 
-CREATE MATERIALIZED VIEW fuel_hourly
+CREATE MATERIALIZED VIEW IF NOT EXISTS fuel_hourly
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
   time_bucket(INTERVAL '1 hour', time) AS bucket,
@@ -28,15 +33,21 @@ COMMENT ON VIEW fuel_hourly IS
 -- re-materializes the buckets of the invalidation log, so late readings of
 -- any age (devices that stored and forwarded, imports of historical data)
 -- are folded in at the next run instead of being left out of a fixed
--- window. Buckets of the last hour are served in real time.
+-- window. TimescaleDB logs one [min, max] range per transaction and chunk;
+-- the service stores each UTC day of a request in its own transaction, so a
+-- request invalidates the days it holds readings for, not the time between
+-- them. Buckets of the last hour are served in real time.
 SELECT add_continuous_aggregate_policy('fuel_hourly',
   start_offset => NULL,
   end_offset => INTERVAL '1 hour',
-  schedule_interval => INTERVAL '15 minutes');
+  schedule_interval => INTERVAL '15 minutes',
+  if_not_exists => true);
 
-SELECT add_retention_policy('fuel_hourly', drop_after => INTERVAL '5 years');
+SELECT add_retention_policy('fuel_hourly',
+  drop_after => INTERVAL '5 years',
+  if_not_exists => true);
 
-CREATE MATERIALIZED VIEW fuel_daily
+CREATE MATERIALIZED VIEW IF NOT EXISTS fuel_daily
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
   time_bucket(INTERVAL '1 day', bucket) AS bucket,
@@ -58,4 +69,5 @@ COMMENT ON VIEW fuel_daily IS
 SELECT add_continuous_aggregate_policy('fuel_daily',
   start_offset => NULL,
   end_offset => INTERVAL '1 day',
-  schedule_interval => INTERVAL '1 hour');
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => true);
