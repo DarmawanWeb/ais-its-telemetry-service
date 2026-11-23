@@ -21,24 +21,32 @@ export class FleetConsumer {
 
   @EventHandler({ consumer: 'telemetry-fleet' })
   async onVessel(event: ConsumerEnvelope<'telemetry-fleet'>): Promise<void> {
-    // The contracts declare the consumer with the widened
-    // `DurableConsumerDefinition` type, so the envelope is the union of every
-    // event; the kit only delivers the consumer's two fleet types here.
-    if (event.type === EVENT_TYPES.FLEET_VESSEL_UPSERTED) {
-      const outcome = await this.vessels.upsert(event.data);
-      this.logger.debug(
-        { vesselId: event.data.id, mmsi: event.data.mmsi, outcome },
-        'vessel projected',
-      );
-    } else if (event.type === EVENT_TYPES.FLEET_VESSEL_DELETED) {
-      const changed = await this.vessels.markDeleted(
-        event.data,
-        new Date(event.time),
-      );
-      this.logger.debug(
-        { vesselId: event.data.id, mmsi: event.data.mmsi, changed },
-        'vessel deleted',
-      );
+    // The envelope is exactly the consumer's two fleet event types
+    // (contracts 0.4 keeps literal consumer types), so the switch is exhaustive.
+    switch (event.type) {
+      case EVENT_TYPES.FLEET_VESSEL_UPSERTED: {
+        const outcome = await this.vessels.upsert(event.data);
+        this.logger.debug(
+          { vesselId: event.data.id, mmsi: event.data.mmsi, outcome },
+          'vessel projected',
+        );
+        return;
+      }
+      case EVENT_TYPES.FLEET_VESSEL_DELETED: {
+        const changed = await this.vessels.markDeleted(
+          event.data,
+          new Date(event.time),
+        );
+        this.logger.debug(
+          { vesselId: event.data.id, mmsi: event.data.mmsi, changed },
+          'vessel deleted',
+        );
+        return;
+      }
+      default: {
+        const unreachable: never = event;
+        return unreachable;
+      }
     }
   }
 }

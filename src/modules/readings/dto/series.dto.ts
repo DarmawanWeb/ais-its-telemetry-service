@@ -18,13 +18,14 @@ import {
   FUEL_READING_SOURCES,
   type FuelReadingSource,
 } from '../../../domain/fuel-reading.js';
-import type { SeriesPoint } from '../readings.repository.js';
+import {
+  SERIES_ORDERS,
+  type SeriesOrder,
+  type SeriesPoint,
+} from '../readings.repository.js';
 
-/** Query of `GET /telemetry/vessels/:mmsi/readings` (cursor-based, time-ordered). */
-export class FuelSeriesQuery extends IntersectionType(
-  CursorQueryDto,
-  TimeRangeQueryDto,
-) {
+/** `from` / `to` and `bucket` of a fuel series (pages and the CSV export). */
+export class FuelSeriesRangeQuery extends TimeRangeQueryDto {
   @ApiPropertyOptional({
     enum: FUEL_BUCKETS,
     default: 'raw',
@@ -34,6 +35,22 @@ export class FuelSeriesQuery extends IntersectionType(
   @IsOptional()
   @IsIn(FUEL_BUCKETS)
   readonly bucket: FuelBucket = 'raw';
+}
+
+/** Query of `GET /telemetry/vessels/:mmsi/readings` (cursor-based, time-ordered). */
+export class FuelSeriesQuery extends IntersectionType(
+  CursorQueryDto,
+  FuelSeriesRangeQuery,
+) {
+  @ApiPropertyOptional({
+    enum: SERIES_ORDERS,
+    default: 'asc',
+    description:
+      '`asc` oldest first (default) or `desc` newest first, e.g. the newest readings with `order=desc&limit=20`; the cursor continues in its own order (a cursor of the other order is a 400)',
+  })
+  @IsOptional()
+  @IsIn(SERIES_ORDERS)
+  readonly order: SeriesOrder = 'asc';
 }
 
 /** A point of a fuel series: a reading, or the sums of a UTC bucket. */

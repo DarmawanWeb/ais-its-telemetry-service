@@ -1,6 +1,10 @@
-import { MetricsService } from '@darmawanweb/ais-its-nest/metrics';
+import {
+  type Counter,
+  type Gauge,
+  type Histogram,
+  MetricsService,
+} from '@darmawanweb/ais-its-nest/metrics';
 import { Injectable } from '@nestjs/common';
-import type { Counter, Gauge, Histogram } from 'prom-client';
 
 /** Upper bounds of the reading lag histogram, s (1 s … 1 day: devices may store and forward). */
 const LAG_BUCKETS_SECONDS = [1, 5, 15, 60, 300, 900, 3600, 21_600, 86_400];

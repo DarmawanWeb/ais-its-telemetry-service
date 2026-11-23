@@ -1,4 +1,9 @@
-import { type Database, InjectDb } from '@darmawanweb/ais-its-nest/db';
+import {
+  type Database,
+  InjectDb,
+  rowDate,
+  rowDateOrNull,
+} from '@darmawanweb/ais-its-nest/db';
 import { Injectable } from '@nestjs/common';
 import {
   and,
@@ -13,6 +18,7 @@ import {
   lte,
   type SQL,
   sql,
+  type SQLWrapper,
 } from 'drizzle-orm';
 
 import * as schema from '../../db/schema.js';
@@ -55,13 +61,23 @@ export interface SeriesPoint {
   readonly deviceId: string | null;
 }
 
-/** A query of a fuel series page (`limit` rows after `after`, ascending). */
+/** Time order of a fuel series: oldest first (`asc`) or newest first (`desc`). */
+export const SERIES_ORDERS = ['asc', 'desc'] as const;
+
+/** A {@link SERIES_ORDERS} member. */
+export type SeriesOrder = (typeof SERIES_ORDERS)[number];
+
+/** A query of a fuel series page: `limit` points of `[from, to)` after `after` in `order`. */
 export interface SeriesQuery {
   readonly mmsi: number;
   readonly bucket: FuelBucket;
   readonly from: Date;
   readonly to: Date;
-  /** Exclusive lower bound of the page (cursor position). */
+  readonly order: SeriesOrder;
+  /**
+   * Exclusive position of the previous page (cursor): the page holds the
+   * points after it in `order`, i.e. later for `asc`, earlier for `desc`.
+   */
   readonly after: Date | undefined;
   readonly limit: number;
 }
@@ -292,8 +308,13 @@ export class ReadingsRepository {
     return row;
   }
 
-  /** One page of a fuel series in ascending time order (fetch `limit + 1` to detect more). */
+  /**
+   * One page of a fuel series in `query.order` (fetch `limit + 1` to detect
+   * more). Readings and buckets are unique per vessel and time, so the time
+   * alone positions a page.
+   */
   async series(query: SeriesQuery): Promise<SeriesPoint[]> {
+    const ascending = query.order === 'asc';
     if (query.bucket === 'raw') {
       const rows = await this.db
         .select(storedColumns)
@@ -303,12 +324,10 @@ export class ReadingsRepository {
             eq(fuelReadings.mmsi, query.mmsi),
             gte(fuelReadings.time, query.from),
             lt(fuelReadings.time, query.to),
-            query.after === undefined
-              ? undefined
-              : gt(fuelReadings.time, query.after),
+            beyond(fuelReadings.time, query.after, ascending),
           ),
         )
-        .orderBy(asc(fuelReadings.time))
+        .orderBy(ascending ? asc(fuelReadings.time) : desc(fuelReadings.time))
         .limit(query.limit);
       return rows.map((row) => ({
         time: row.time,
@@ -334,10 +353,10 @@ export class ReadingsRepository {
           eq(view.mmsi, query.mmsi),
           gte(view.bucket, query.from),
           lt(view.bucket, query.to),
-          query.after === undefined ? undefined : gt(view.bucket, query.after),
+          beyond(view.bucket, query.after, ascending),
         ),
       )
-      .orderBy(asc(view.bucket))
+      .orderBy(ascending ? asc(view.bucket) : desc(view.bucket))
       .limit(query.limit);
     return rows.map((row) => ({
       time: row.bucket,
@@ -374,8 +393,8 @@ export class ReadingsRepository {
             readings: row.readings,
             fuelMeTon: roundFuelSum(row.fuel_me_ton ?? 0),
             fuelAeTon: roundFuelSum(row.fuel_ae_ton ?? 0),
-            firstReadingAt: asNullableDate(row.first_time),
-            lastReadingAt: asNullableDate(row.last_time),
+            firstReadingAt: rowDateOrNull(row.first_time),
+            lastReadingAt: rowDateOrNull(row.last_time),
           },
     );
   }
@@ -425,7 +444,7 @@ export class ReadingsRepository {
       orgId: row.org_id,
       name: row.name,
       status: row.status,
-      lastReadingAt: asNullableDate(row.last_reading_at),
+      lastReadingAt: rowDateOrNull(row.last_reading_at),
       devices: row.devices,
     }));
     return { rows, total: totals[0]?.total ?? 0 };
@@ -442,6 +461,16 @@ const storedColumns = {
   source: fuelReadings.source,
   receivedAt: fuelReadings.receivedAt,
 };
+
+/** The keyset condition of a page: after `position` in the page order (none on the first page). */
+function beyond(
+  column: SQLWrapper,
+  position: Date | undefined,
+  ascending: boolean,
+): SQL | undefined {
+  if (position === undefined) return undefined;
+  return ascending ? gt(column, position) : lt(column, position);
+}
 
 function aggregateView(
   bucket: AggregateBucket,
@@ -502,14 +531,14 @@ async function selectByKeys(
         AND r.time >= ${from} AND r.time <= ${to}`);
     for (const row of result.rows) {
       rows.push({
-        time: asDate(row.time),
+        time: rowDate(row.time),
         mmsi: row.mmsi,
         deviceId: row.device_id,
-        periodStart: asNullableDate(row.period_start),
+        periodStart: rowDateOrNull(row.period_start),
         fuelMeTon: row.fuel_me_ton,
         fuelAeTon: row.fuel_ae_ton,
         source: row.source,
-        receivedAt: asDate(row.received_at),
+        receivedAt: rowDate(row.received_at),
       });
     }
   }
@@ -585,13 +614,4 @@ function keyArrays(keys: readonly ReadingKeyed[]): {
 
 function keyOf(key: ReadingKeyed): string {
   return `${key.mmsi}:${key.time.getTime()}`;
-}
-
-/** A timestamptz of a raw statement (drizzle's driver setup returns them as text). */
-function asDate(value: Date | string): Date {
-  return value instanceof Date ? value : new Date(value);
-}
-
-function asNullableDate(value: Date | string | null): Date | null {
-  return value === null ? null : asDate(value);
 }

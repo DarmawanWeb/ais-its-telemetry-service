@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import {
   TEST_CONTAINER_LABELS,
   TEST_IMAGES,
+  testNatsConfig,
 } from '@darmawanweb/ais-its-nest/testing';
 import {
   GenericContainer,
@@ -28,8 +29,11 @@ const PUBLISH_TIMEOUT_MS = 1000;
 /**
  * A NATS server of this file only: `docker pause` freezes it with its TCP
  * connections open, so publishes neither fail fast nor get acknowledged —
- * a stalled server, unlike a stopped one. Labelled like the kit's test
- * containers so `reapOrphanedTestContainers()` also removes it.
+ * a stalled server, unlike a stopped one (the shared server of
+ * `startTestInfra` exposes no container to pause). It runs the kit's test
+ * configuration (`testNatsConfig()`: JetStream, `max_payload` 4MB) and is
+ * labelled like the kit's test containers, so `reapOrphanedTestContainers()`
+ * also removes it.
  */
 async function startOwnNats(): Promise<StartedTestContainer> {
   return new GenericContainer(TEST_IMAGES.nats)
@@ -38,7 +42,10 @@ async function startOwnNats(): Promise<StartedTestContainer> {
       [TEST_CONTAINER_LABELS.pid]: String(process.pid),
       [TEST_CONTAINER_LABELS.host]: hostname(),
     })
-    .withCommand(['-js'])
+    .withCopyContentToContainer([
+      { content: testNatsConfig(), target: '/etc/nats/test.conf' },
+    ])
+    .withCommand(['-c', '/etc/nats/test.conf'])
     .withExposedPorts(4222)
     .withWaitStrategy(Wait.forLogMessage(/Server is ready/))
     .withStartupTimeout(60_000)

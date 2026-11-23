@@ -9,4 +9,7 @@ export const IMPLEMENTED_METHOD_IDS: readonly string[] = [
   'fuel.method_selection',
   // src/domain/fuel-aggregation.ts — addTotals / totalFuelTon (Σ readings per window).
   'telemetry.fuel_reading_usage',
+  // src/domain/fuel-reading.ts — readingViolations, batchViolations, repeatViolations
+  // (plausibility rules of every ingestion path).
+  'telemetry.reading_validation',
 ];

@@ -1,14 +1,15 @@
+import { IsOptionalNotNull } from '@darmawanweb/ais-its-nest/http';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsIn,
   IsInt,
+  IsOptional,
   IsString,
   IsUUID,
   Length,
   Max,
   Min,
-  ValidateIf,
 } from 'class-validator';
 
 import {
@@ -20,23 +21,10 @@ import {
 import { trimString } from './create-device.dto.js';
 
 /**
- * Validates a field only when it is present: unlike `@IsOptional()`, which
- * also skips `null`, a `null` then fails the field's validators (`400`), so
- * it can never reach a NOT NULL column.
- */
-const IfPresent = () =>
-  ValidateIf((_object: object, value: unknown) => value !== undefined);
-
-/** Validates a field unless it is absent or `null` (the nullable fields: `null` clears them). */
-const IfPresentAndNotNull = () =>
-  ValidateIf(
-    (_object: object, value: unknown) => value !== undefined && value !== null,
-  );
-
-/**
  * `PATCH /telemetry/devices/:id`: absent fields are kept, `null` clears
- * `apiKeyId` / `serialNumber`; `mmsi`, `name`, `kind` and `status` cannot
- * be `null`.
+ * `apiKeyId` / `serialNumber` (`@IsOptional()`); `mmsi`, `name`, `kind` and
+ * `status` cannot be `null` (the kit's `@IsOptionalNotNull()` validates every
+ * value but `undefined`, so `null` is a `400`, never a NOT NULL violation).
  */
 export class UpdateDeviceDto {
   @ApiPropertyOptional({
@@ -44,21 +32,21 @@ export class UpdateDeviceDto {
     minimum: 100_000_000,
     maximum: 999_999_999,
   })
-  @IfPresent()
+  @IsOptionalNotNull()
   @IsInt()
   @Min(100_000_000)
   @Max(999_999_999)
   readonly mmsi?: number;
 
   @ApiPropertyOptional({ minLength: 1, maxLength: 120 })
-  @IfPresent()
+  @IsOptionalNotNull()
   @Transform(trimString)
   @IsString()
   @Length(1, 120)
   readonly name?: string;
 
   @ApiPropertyOptional({ enum: DEVICE_KINDS })
-  @IfPresent()
+  @IsOptionalNotNull()
   @IsIn(DEVICE_KINDS)
   readonly kind?: DeviceKind;
 
@@ -69,12 +57,12 @@ export class UpdateDeviceDto {
     description:
       'API key of an http device; `null` unlinks it (required for http devices)',
   })
-  @IfPresentAndNotNull()
+  @IsOptional()
   @IsUUID()
   readonly apiKeyId?: string | null;
 
   @ApiPropertyOptional({ enum: DEVICE_STATUSES })
-  @IfPresent()
+  @IsOptionalNotNull()
   @IsIn(DEVICE_STATUSES)
   readonly status?: DeviceStatus;
 
@@ -85,7 +73,7 @@ export class UpdateDeviceDto {
     maxLength: 120,
   })
   @Transform(trimString)
-  @IfPresentAndNotNull()
+  @IsOptional()
   @IsString()
   @Length(1, 120)
   readonly serialNumber?: string | null;

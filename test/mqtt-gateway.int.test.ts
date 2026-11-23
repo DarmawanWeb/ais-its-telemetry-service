@@ -1,19 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { hostname } from 'node:os';
 
 import { telemetryMqttTopic } from '@darmawanweb/ais-its-contracts/events';
 import {
-  TEST_CONTAINER_LABELS,
-  TEST_IMAGES,
+  testInfra,
   uniqueName,
   waitFor,
 } from '@darmawanweb/ais-its-nest/testing';
 import { connectAsync, type MqttClient } from 'mqtt';
-import {
-  GenericContainer,
-  type StartedTestContainer,
-  Wait,
-} from 'testcontainers';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { readFuelEvents } from './support/fuel-events.js';
@@ -26,37 +19,11 @@ import {
 } from './support/test-service.js';
 
 /**
- * NATS with JetStream and the MQTT gateway on 1883, as in the platform's
- * compose file (`nats` service). The kit's `startTestInfra()` has no MQTT
- * option, so this file starts its own server (labelled like the kit's test
- * containers, so `reapOrphanedTestContainers()` also removes it).
+ * The shared test NATS runs the MQTT gateway on 1883 like the platform's
+ * compose file (`nats` service): `testInfraGlobalSetup({ nats: { mqtt: true } })`
+ * in `test/support/global-setup.ts`, its URL in `testInfra('nats').nats.mqttUrl`.
  */
-const MQTT_NATS_CONFIG = `
-server_name: telemetry-mqtt-test
-port: 4222
-jetstream { store_dir: /tmp/jetstream }
-mqtt { port: 1883 }
-`;
-
-async function startMqttNats(): Promise<StartedTestContainer> {
-  return new GenericContainer(TEST_IMAGES.nats)
-    .withLabels({
-      [TEST_CONTAINER_LABELS.marker]: 'true',
-      [TEST_CONTAINER_LABELS.pid]: String(process.pid),
-      [TEST_CONTAINER_LABELS.host]: hostname(),
-    })
-    .withCopyContentToContainer([
-      { content: MQTT_NATS_CONFIG, target: '/etc/nats/mqtt.conf' },
-    ])
-    .withCommand(['-c', '/etc/nats/mqtt.conf'])
-    .withExposedPorts(4222, 1883)
-    .withWaitStrategy(Wait.forLogMessage(/Server is ready/))
-    .withStartupTimeout(60_000)
-    .start();
-}
-
 describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
-  let nats: StartedTestContainer | undefined;
   let service: TestService | undefined;
   let meter: MqttClient | undefined;
   const orgId = newOrgId();
@@ -69,10 +36,10 @@ describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
   };
 
   beforeAll(async () => {
-    nats = await startMqttNats();
-    service = await startTestService({
-      natsUrl: `nats://${nats.getHost()}:${nats.getMappedPort(4222)}`,
-    });
+    const { mqttUrl } = testInfra('nats').nats;
+    if (mqttUrl === undefined)
+      throw new Error('the global setup started NATS without MQTT');
+    service = await startTestService();
     await service.publishVessel({ mmsi: vessel, orgId });
     const admin = await service.authorization({ roles: ['org_admin'], orgId });
     const created = await service.app.inject({
@@ -86,21 +53,17 @@ describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
     deviceId = device.id;
     expect(device.mqttTopic).toBe(`aisits/telemetry/${deviceId}`);
 
-    meter = await connectAsync(
-      `mqtt://${nats.getHost()}:${nats.getMappedPort(1883)}`,
-      {
-        clientId: uniqueName('fuel-meter'),
-        clean: true,
-        connectTimeout: 10_000,
-        reconnectPeriod: 0,
-      },
-    );
+    meter = await connectAsync(mqttUrl, {
+      clientId: uniqueName('fuel-meter'),
+      clean: true,
+      connectTimeout: 10_000,
+      reconnectPeriod: 0,
+    });
   });
 
   afterAll(async () => {
     await meter?.endAsync();
     await service?.close();
-    await nats?.stop();
   });
 
   it('stores what a meter publishes to aisits/telemetry/<deviceId> (QoS 1) and publishes it to FUEL', async () => {

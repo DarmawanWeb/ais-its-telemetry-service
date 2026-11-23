@@ -1,4 +1,5 @@
 import { InjectConfig } from '@darmawanweb/ais-its-nest';
+import { sanitizeError } from '@darmawanweb/ais-its-nest/db';
 import { NatsClient } from '@darmawanweb/ais-its-nest/nats';
 import {
   type BeforeApplicationShutdown,
@@ -120,7 +121,11 @@ export class ReadingRelay
       this.metrics.unpublished.set(backlog.pending);
       this.metrics.oldestUnpublished.set(backlog.oldestAgeSeconds);
     } catch (error) {
-      this.logger.warn({ err: error }, 'Publication relay tick failed');
+      // Database errors without their bound values (kit `sanitizeError`).
+      this.logger.warn(
+        { err: sanitizeError(error) },
+        'Publication relay tick failed',
+      );
     }
   }
 }

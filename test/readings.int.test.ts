@@ -726,6 +726,184 @@ describe('fuel readings over REST', () => {
       expect(await series('1d')).toEqual(expectedDaily);
     });
 
+    it('pages newest first with order=desc, the cursor continuing backwards', async () => {
+      const range = `from=${at(0)}&to=${at(48)}`;
+      interface Page {
+        data: { time: string }[];
+        page: { nextCursor: string | null };
+      }
+      const first = await get(
+        `${queryVessel}/readings?${range}&order=desc&limit=3`,
+      );
+      expect(first.statusCode).toBe(200);
+      const page1 = first.json<Page>();
+      const newestFirst = readings.map((r) => r.time).reverse();
+      expect(page1.data.map((point) => point.time)).toEqual(
+        newestFirst.slice(0, 3),
+      );
+      const second = await get(
+        `${queryVessel}/readings?${range}&order=desc&limit=3&cursor=${page1.page.nextCursor ?? ''}`,
+      );
+      const page2 = second.json<Page>();
+      expect(page2.data.map((point) => point.time)).toEqual(
+        newestFirst.slice(3),
+      );
+      expect(page2.page.nextCursor).toBeNull();
+
+      // Bucket sums too (refreshed by the previous test): newest day first.
+      const daily = await get(
+        `${queryVessel}/readings?${range}&bucket=1d&order=desc`,
+      );
+      expect(daily.json<Page>().data.map((point) => point.time)).toEqual([
+        at(24),
+        at(0),
+      ]);
+
+      // A cursor keeps its order: one of a newest-first page is no ascending cursor.
+      const mixed = await get(
+        `${queryVessel}/readings?${range}&limit=3&cursor=${page1.page.nextCursor ?? ''}`,
+      );
+      expect(mixed.statusCode).toBe(400);
+      expect(mixed.json()).toMatchObject({
+        code: 'VALIDATION_FAILED',
+        errors: [expect.objectContaining({ field: 'cursor' })],
+      });
+      expect(
+        (await get(`${queryVessel}/readings?order=newest`)).statusCode,
+      ).toBe(400);
+    });
+
+    it('exports the series as a streamed CSV file with the values of the JSON points', async () => {
+      const range = `from=${at(0)}&to=${at(48)}`;
+      const compact = (iso: string) =>
+        iso
+          .replace(/\.\d{3}Z$/, 'Z')
+          .replaceAll('-', '')
+          .replaceAll(':', '');
+      const exported = await service.app.inject({
+        method: 'GET',
+        url: `/api/v2/telemetry/vessels/${queryVessel}/readings.csv?${range}`,
+        headers: { ...reader, origin: 'http://localhost:5173' },
+      });
+      expect(exported.statusCode).toBe(200);
+      expect(exported.headers['content-type']).toBe(
+        'text/csv; charset=utf-8; header=present',
+      );
+      expect(exported.headers['content-disposition']).toBe(
+        `attachment; filename="telemetry-${queryVessel}-raw-${compact(at(0))}_${compact(at(48))}.csv"`,
+      );
+      // The web app (another origin in development) can read the file name.
+      expect(exported.headers['access-control-expose-headers']).toContain(
+        'Content-Disposition',
+      );
+      const lines = exported.body.split('\r\n');
+      expect(lines[0]).toBe(
+        'time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId',
+      );
+      expect(lines.at(-1)).toBe('');
+      expect(lines.slice(1, -1)).toEqual([
+        `${at(10.25)},,1,0.1,1.1,1,api,`,
+        `${at(10.75)},,2,0.2,2.2,1,api,`,
+        `${at(11.5)},,4,0.4,4.4,1,api,`,
+        `${at(24.5)},${at(24)},8,0.8,8.8,1,api,`,
+      ]);
+
+      // Buckets: the same points as the JSON series, without the raw-only fields.
+      interface Point {
+        time: string;
+        fuelMeTon: number;
+        fuelAeTon: number;
+        totalFuelTon: number;
+        readings: number;
+      }
+      const hourlyJson = (
+        await get(`${queryVessel}/readings?${range}&bucket=1h`)
+      ).json<{ data: Point[] }>().data;
+      const hourlyCsv = await get(
+        `${queryVessel}/readings.csv?${range}&bucket=1h`,
+      );
+      expect(hourlyCsv.body.split('\r\n').slice(1, -1)).toEqual(
+        hourlyJson.map(
+          (point) =>
+            `${point.time},,${point.fuelMeTon},${point.fuelAeTon},${point.totalFuelTon},${point.readings},,`,
+        ),
+      );
+
+      // No readings in the range: the header line only.
+      const empty = await get(
+        `${queryVessel}/readings.csv?from=${at(-48)}&to=${at(-24)}`,
+      );
+      expect(empty.statusCode).toBe(200);
+      expect(empty.body).toBe(
+        'time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId\r\n',
+      );
+    });
+
+    it('checks the export like the series before streaming (problem details)', async () => {
+      const readerB = await service.authorization({
+        roles: ['fleet_manager'],
+        orgId: orgB,
+      });
+      const viewer = await service.authorization({
+        roles: ['viewer'],
+        orgId: orgA,
+      });
+      const expectProblem = async (
+        path: string,
+        headers: Record<string, string>,
+        status: number,
+        code: string,
+      ) => {
+        const response = await get(path, headers);
+        expect(response.statusCode).toBe(status);
+        expect(response.headers['content-type']).toContain(
+          'application/problem+json',
+        );
+        expect(response.json()).toMatchObject({ code });
+      };
+      await expectProblem(
+        `${queryVessel}/readings.csv`,
+        readerB,
+        403,
+        'FORBIDDEN',
+      );
+      await expectProblem(
+        `${queryVessel}/readings.csv`,
+        viewer,
+        403,
+        'FORBIDDEN',
+      );
+      await expectProblem(
+        `${unknownVessel}/readings.csv`,
+        reader,
+        404,
+        'VESSEL_NOT_FOUND',
+      );
+      // Raw exports cover at most 31 days, like the raw series.
+      await expectProblem(
+        `${queryVessel}/readings.csv?from=${at(-40 * 24)}&to=${at(0)}`,
+        reader,
+        400,
+        'VALIDATION_FAILED',
+      );
+      // Paging parameters do not apply to the export.
+      await expectProblem(
+        `${queryVessel}/readings.csv?limit=10`,
+        reader,
+        400,
+        'VALIDATION_FAILED',
+      );
+      expect(
+        (
+          await service.app.inject({
+            method: 'GET',
+            url: `/api/v2/telemetry/vessels/${queryVessel}/readings.csv`,
+            headers: keyA.headers,
+          })
+        ).statusCode,
+      ).toBe(401);
+    });
+
     it('sums readings over any range exactly (raw edges, hours, days)', async () => {
       const summary = async (from: string, to: string) =>
         (await get(`${queryVessel}/summary?from=${from}&to=${to}`)).json<
@@ -812,7 +990,27 @@ describe('fuel readings over REST', () => {
       expect((await get(`${queryVessel}/readings`, viewer)).statusCode).toBe(
         403,
       );
-      expect((await get('12345/status')).statusCode).toBe(400);
+      // `:mmsi` is parsed from the raw path segment (kit @MmsiParam()): exactly
+      // nine digits. 0.1.0's global ValidationPipe coerced the segment with
+      // `+value` before its MMSI check, so the zero-padded, decimal,
+      // space-padded, exponent and hex forms passed (the hex one as another
+      // MMSI, 524950887); now they are `isMmsi` like any malformed MMSI.
+      for (const malformed of [
+        '12345',
+        '52500522x',
+        '0525005223',
+        '525005223.0',
+        '%20525005223',
+        '5.25005223e8',
+        '0x1F4A1D67',
+      ]) {
+        const invalid = await get(`${malformed}/status`);
+        expect(invalid.statusCode, malformed).toBe(400);
+        expect(invalid.json(), malformed).toMatchObject({
+          code: 'VALIDATION_FAILED',
+          errors: [expect.objectContaining({ field: 'mmsi', code: 'isMmsi' })],
+        });
+      }
       const admin = await service.authorization({ roles: ['super_admin'] });
       expect(
         (

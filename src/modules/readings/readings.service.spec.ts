@@ -1,6 +1,8 @@
+import { encodeCursor } from '@darmawanweb/ais-its-contracts/api';
 import { loadConfig, ValidationFailedError } from '@darmawanweb/ais-its-nest';
 import type { AuditService } from '@darmawanweb/ais-its-nest/audit';
 import { ApiKeyPrincipal, UserPrincipal } from '@darmawanweb/ais-its-nest/auth';
+import { SanitizedDatabaseError } from '@darmawanweb/ais-its-nest/db';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -19,8 +21,11 @@ import { VesselAccessService } from '../vessels/vessel-access.service.js';
 import type { VesselsRepository } from '../vessels/vessels.repository.js';
 import type { IngestBatch, NewReading, StoredReading } from './reading.js';
 import type { ReadingIngestService } from './reading-ingest.service.js';
-import type { ReadingsRepository } from './readings.repository.js';
-import { ReadingsService } from './readings.service.js';
+import type { ReadingsRepository, SeriesPoint } from './readings.repository.js';
+import {
+  ReadingsService,
+  SERIES_EXPORT_BATCH_SIZE,
+} from './readings.service.js';
 
 const NOW = new Date('2026-11-21T10:00:00.000Z');
 const ORG = '0193a0f2-0000-7000-8000-00000000000a';
@@ -108,6 +113,7 @@ describe('ReadingsService', () => {
   const record = vi.fn<AuditService['record']>();
   const latest = vi.fn<ReadingsRepository['latest']>();
   const pieceTotals = vi.fn<ReadingsRepository['pieceTotals']>();
+  const series = vi.fn<ReadingsRepository['series']>();
   let service: ReadingsService;
 
   beforeEach(() => {
@@ -127,7 +133,7 @@ describe('ReadingsService', () => {
     const findLive = (mmsis: readonly number[]) =>
       Promise.resolve(FLEET.filter((v) => mmsis.includes(v.mmsi)));
     service = new ReadingsService(
-      { latest, pieceTotals } as unknown as ReadingsRepository,
+      { latest, pieceTotals, series } as unknown as ReadingsRepository,
       { store, publish } as unknown as ReadingIngestService,
       new VesselAccessService({ findLive } as unknown as VesselsRepository),
       { deviceOfApiKey, markSeen } as unknown as DevicesService,
@@ -457,6 +463,179 @@ describe('ReadingsService', () => {
       const summary = await service.summary(525005223, {}, apiKey);
       expect(summary.to).toEqual(NOW);
       expect(NOW.getTime() - summary.from.getTime()).toBe(30 * 86_400_000);
+    });
+  });
+
+  /** A raw point `minutes` after 08:00 of NOW's day. */
+  const point = (minutes: number): SeriesPoint => ({
+    time: new Date(Date.UTC(2026, 10, 21, 8, minutes)),
+    fuelMeTon: 0.4,
+    fuelAeTon: 0.05,
+    readings: 1,
+    periodStart: null,
+    source: 'api',
+    deviceId: null,
+  });
+  const range = {
+    from: '2026-11-21T00:00:00Z',
+    to: '2026-11-21T10:00:00Z',
+  } as const;
+
+  describe('series', () => {
+    it('pages newest first with order=desc and continues before the last point', async () => {
+      const manager = user(['fleet_manager']);
+      series.mockResolvedValueOnce([point(30), point(20), point(10)]);
+      const first = await service.series(
+        525005223,
+        { ...range, bucket: 'raw', order: 'desc', limit: 2 },
+        manager,
+      );
+      expect(series).toHaveBeenLastCalledWith(
+        expect.objectContaining({ order: 'desc', after: undefined, limit: 3 }),
+      );
+      expect(first.data).toEqual([point(30), point(20)]);
+      expect(first.page.nextCursor).toEqual(expect.any(String));
+
+      series.mockResolvedValueOnce([point(10)]);
+      const second = await service.series(
+        525005223,
+        {
+          ...range,
+          bucket: 'raw',
+          order: 'desc',
+          limit: 2,
+          cursor: first.page.nextCursor ?? '',
+        },
+        manager,
+      );
+      expect(series).toHaveBeenLastCalledWith(
+        expect.objectContaining({ order: 'desc', after: point(20).time }),
+      );
+      expect(second.page.nextCursor).toBeNull();
+    });
+
+    it('refuses a cursor of the other order (400) and reads cursors without an order as ascending', async () => {
+      const manager = user(['fleet_manager']);
+      series.mockResolvedValue([point(10), point(20)]);
+      const ascending = await service.series(
+        525005223,
+        { ...range, bucket: 'raw', order: 'asc', limit: 1 },
+        manager,
+      );
+      const cursor = ascending.page.nextCursor ?? '';
+      await expect(
+        service.series(
+          525005223,
+          { ...range, bucket: 'raw', order: 'desc', limit: 1, cursor },
+          manager,
+        ),
+      ).rejects.toMatchObject({
+        errors: [
+          expect.objectContaining({ field: 'cursor', code: 'isCursor' }),
+        ],
+      });
+
+      // A cursor issued before `order` existed ({ b, t }) continues ascending.
+      const legacy = encodeCursor({ b: 'raw', t: '2026-11-21T08:10:00.000Z' });
+      await service.series(
+        525005223,
+        { ...range, bucket: 'raw', order: 'asc', limit: 1, cursor: legacy },
+        manager,
+      );
+      expect(series).toHaveBeenLastCalledWith(
+        expect.objectContaining({ order: 'asc', after: point(10).time }),
+      );
+      await expect(
+        service.series(
+          525005223,
+          { ...range, bucket: 'raw', order: 'desc', limit: 1, cursor: legacy },
+          manager,
+        ),
+      ).rejects.toBeInstanceOf(ValidationFailedError);
+    });
+  });
+
+  describe('exportSeries', () => {
+    const full = Array.from({ length: SERIES_EXPORT_BATCH_SIZE }, (_, index) =>
+      point(index / 1000),
+    );
+
+    async function collect(
+      batches: AsyncIterable<readonly SeriesPoint[]>,
+    ): Promise<SeriesPoint[]> {
+      const points: SeriesPoint[] = [];
+      for await (const batch of batches) points.push(...batch);
+      return points;
+    }
+
+    it('reads the first batch before streaming and the rest in keyset batches, ascending', async () => {
+      series
+        .mockResolvedValueOnce(full)
+        .mockResolvedValueOnce([point(30), point(40)]);
+      const exported = await service.exportSeries(
+        525005223,
+        { ...range, bucket: 'raw' },
+        user(['fleet_manager']),
+      );
+      expect(exported).toMatchObject({
+        mmsi: 525005223,
+        bucket: 'raw',
+        from: new Date(range.from),
+        to: new Date(range.to),
+      });
+      // The first batch is read before the response starts (errors become problems).
+      expect(series).toHaveBeenCalledTimes(1);
+      expect(series).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          order: 'asc',
+          after: undefined,
+          limit: SERIES_EXPORT_BATCH_SIZE,
+        }),
+      );
+
+      const points = await collect(exported.batches);
+      expect(points).toHaveLength(SERIES_EXPORT_BATCH_SIZE + 2);
+      expect(series).toHaveBeenCalledTimes(2);
+      expect(series).toHaveBeenLastCalledWith(
+        expect.objectContaining({ after: full.at(-1)?.time }),
+      );
+    });
+
+    it('applies tenancy and the range limits of the bucket before reading anything', async () => {
+      await expect(
+        service.exportSeries(525009999, { bucket: 'raw' }, apiKey),
+      ).rejects.toBeInstanceOf(VesselAccessDeniedError);
+      await expect(
+        service.exportSeries(
+          525005223,
+          { bucket: 'raw', from: '2026-10-01T00:00:00Z', to: range.to },
+          apiKey,
+        ),
+      ).rejects.toBeInstanceOf(ValidationFailedError);
+      expect(series).not.toHaveBeenCalled();
+    });
+
+    it('ends the stream with a sanitized error when a later batch fails', async () => {
+      const driverError = Object.assign(
+        new Error('canceling statement due to statement timeout'),
+        {
+          code: '57014',
+          severity: 'ERROR',
+          detail: 'Key (mmsi)=(525005223) is secret',
+        },
+      );
+      series.mockResolvedValueOnce(full).mockRejectedValueOnce(driverError);
+      const exported = await service.exportSeries(
+        525005223,
+        { ...range, bucket: 'raw' },
+        user(['fleet_manager']),
+      );
+      const failure: unknown = await collect(exported.batches).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(SanitizedDatabaseError);
+      expect(failure).toMatchObject({ code: '57014' });
+      expect(JSON.stringify(failure)).not.toContain('secret');
     });
   });
 });

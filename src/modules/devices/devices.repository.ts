@@ -107,6 +107,26 @@ export class DevicesRepository {
     return { rows, total: totals[0]?.total ?? 0 };
   }
 
+  /** The devices of an organization on one vessel, by name. */
+  async listOfVessel(
+    orgId: string,
+    mmsi: number,
+    page: { readonly offset: number; readonly limit: number },
+  ): Promise<DevicePage> {
+    const where = and(eq(devices.orgId, orgId), eq(devices.mmsi, mmsi));
+    const [rows, totals] = await Promise.all([
+      this.db
+        .select()
+        .from(devices)
+        .where(where)
+        .orderBy(asc(devices.name), asc(devices.id))
+        .limit(page.limit)
+        .offset(page.offset),
+      this.db.select({ total: count() }).from(devices).where(where),
+    ]);
+    return { rows, total: totals[0]?.total ?? 0 };
+  }
+
   /** Applies `changes` and bumps `updated_at`; `undefined` when no device matched. */
   async update(
     id: string,

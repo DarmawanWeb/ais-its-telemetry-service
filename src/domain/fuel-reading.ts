@@ -88,9 +88,10 @@ export interface ReadingViolation {
  * retention period); a `periodStart` lies before `time` and the period
  * lasts at most `maxPeriodMs`. Pure: the caller passes the clock.
  *
- * Not in the methodology catalog yet (proposed id `telemetry.reading_validation`);
- * the maxima are v2 design defaults, not values from a cited source.
+ * The 5-minute skew comes from spec §13.4; the fuel maxima, the 24-h period
+ * and the 5-year age are v2 design defaults, not values from a cited source.
  *
+ * @method telemetry.reading_validation
  * @returns every violation (empty when the reading is plausible).
  */
 export function readingViolations(
@@ -169,7 +170,10 @@ export function readingViolations(
 
 /**
  * {@link readingViolations} of every reading of a batch plus
- * {@link repeatViolations}, ordered by batch index.
+ * {@link repeatViolations}, ordered by batch index (the batch limit of 1000
+ * readings, spec §13.4, is checked by the request parsers).
+ *
+ * @method telemetry.reading_validation
  */
 export function batchViolations(
   readings: readonly FuelReadingInput[],
@@ -190,9 +194,10 @@ export function batchViolations(
  * keeping either would silently drop the other. Exact repeats are fine
  * (they are idempotent duplicates, see {@link dedupeReadings}).
  *
- * Part of the plausibility rules (proposed catalog id `telemetry.reading_validation`,
- * see {@link readingViolations}); a v2 data-integrity rule without an external source.
+ * Part of the plausibility rules (see {@link readingViolations}); a v2
+ * data-integrity rule without an external source.
  *
+ * @method telemetry.reading_validation
  * @returns a `conflicting_repeat` violation on `time` for every reading that
  * repeats the key of an earlier reading of the batch with other values.
  */
@@ -266,8 +271,9 @@ export interface StoredComparison<T> {
  * report the same instant are a conflict even with equal amounts, because
  * the stored row can hold only one of them. The source label is not compared
  * (a user re-posting a manual entry as an import repeats the same data).
- * A v2 data-integrity rule (spec §13.4: duplicates idempotent by `(mmsi, time)`),
- * listed with the proposed catalog id `telemetry.reading_validation`.
+ * A v2 data-integrity rule (spec §13.4: duplicates idempotent by `(mmsi, time)`).
+ *
+ * @method telemetry.reading_validation
  */
 export function compareWithStored<T extends AttributedReading>(
   readings: readonly T[],

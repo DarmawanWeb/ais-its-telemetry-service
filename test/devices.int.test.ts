@@ -351,7 +351,12 @@ describe('device registry /telemetry/devices (device:manage)', () => {
     expect((await request('DELETE', `/${device.id}`, adminA)).statusCode).toBe(
       404,
     );
-    expect((await request('GET', '/not-a-uuid', adminA)).statusCode).toBe(400);
+    const malformed = await request('GET', '/not-a-uuid', adminA);
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.json()).toMatchObject({
+      code: 'VALIDATION_FAILED',
+      errors: [expect.objectContaining({ field: 'id', code: 'isUuid' })],
+    });
   });
 
   it('hides devices of other organizations and requires device:manage', async () => {
@@ -395,6 +400,104 @@ describe('device registry /telemetry/devices (device:manage)', () => {
     expect(
       (await request('GET', '', service.apiKey(orgA).headers)).statusCode,
     ).toBe(401);
+  });
+
+  it('lists the devices of a vessel read-only for telemetry:read, without credentials', async () => {
+    const [vessel, bare] = uniqueMmsis(2) as [number, number];
+    await service.publishVessel({ mmsi: vessel, orgId: orgA });
+    await service.publishVessel({ mmsi: bare, orgId: orgA });
+    const meterB = await create({
+      mmsi: vessel,
+      name: 'Vessel meter B',
+      kind: 'http',
+      apiKeyId: randomUUID(),
+      serialNumber: 'SN-B',
+    });
+    const meterA = await create({
+      mmsi: vessel,
+      name: 'Vessel meter A',
+      kind: 'mqtt',
+    });
+    await create({ mmsi: vesselA1, name: 'Meter elsewhere', kind: 'mqtt' });
+    expect(
+      (await request('PATCH', `/${meterB.id}`, adminA, { status: 'inactive' }))
+        .statusCode,
+    ).toBe(200);
+
+    const list = (
+      mmsi: number | string,
+      headers: Record<string, string>,
+      query = '',
+    ) =>
+      service.app.inject({
+        method: 'GET',
+        url: `/api/v2/telemetry/vessels/${mmsi}/devices${query}`,
+        headers,
+      });
+    const manager = await service.authorization({
+      roles: ['fleet_manager'],
+      orgId: orgA,
+    });
+    const response = await list(vessel, manager);
+    expect(response.statusCode).toBe(200);
+    // By name; id, name, kind, status and lastSeenAt only (no API key,
+    // serial number, MQTT topic or creator).
+    expect(response.json()).toEqual({
+      data: [
+        {
+          id: meterA.id,
+          name: 'Vessel meter A',
+          kind: 'mqtt',
+          status: 'active',
+          lastSeenAt: null,
+        },
+        {
+          id: meterB.id,
+          name: 'Vessel meter B',
+          kind: 'http',
+          status: 'inactive',
+          lastSeenAt: null,
+        },
+      ],
+      meta: { page: 1, pageSize: 20, total: 2 },
+    });
+    expect(
+      (await list(vessel, manager, '?page=2&pageSize=1')).json(),
+    ).toMatchObject({
+      data: [{ id: meterB.id }],
+      meta: { page: 2, pageSize: 1, total: 2 },
+    });
+    expect((await list(bare, manager)).json()).toEqual({
+      data: [],
+      meta: { page: 1, pageSize: 20, total: 0 },
+    });
+    expect(
+      (await list(vessel, superAdmin)).json<DevicePageBody>().meta.total,
+    ).toBe(2);
+
+    // Tenancy and permissions: the vessel's organization only, telemetry:read.
+    const managerB = await service.authorization({
+      roles: ['fleet_manager'],
+      orgId: orgB,
+    });
+    expect((await list(vessel, managerB)).json()).toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    const viewer = await service.authorization({
+      roles: ['viewer'],
+      orgId: orgA,
+    });
+    expect((await list(vessel, viewer)).statusCode).toBe(403);
+    expect((await list(unknownVessel, manager)).json()).toMatchObject({
+      code: 'VESSEL_NOT_FOUND',
+    });
+    expect((await list('12345', manager)).json()).toMatchObject({
+      code: 'VALIDATION_FAILED',
+      errors: [expect.objectContaining({ field: 'mmsi', code: 'isMmsi' })],
+    });
+    expect((await list(vessel, service.apiKey(orgA).headers)).statusCode).toBe(
+      401,
+    );
   });
 
   it('records an audit event for every change', async () => {

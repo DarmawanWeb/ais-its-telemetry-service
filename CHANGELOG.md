@@ -6,6 +6,87 @@ All notable changes to `ais-its-telemetry-service` are documented in this file. 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
+Upgrade to `@darmawanweb/ais-its-contracts` 0.4.0 and `@darmawanweb/ais-its-nest` 0.3.0: the
+local workarounds for the platform issues this service reported are gone (stream re-creation,
+MQTT test infrastructure, the widened fleet envelope), template helpers replace local ones, and
+the backend gaps the web app reported are closed. No migration; 0.1.0 and 0.2.0 replicas can run
+side by side during a rolling update (same tables, subjects, queue group and durable), but only
+0.2.0 answers the new API: a 0.1.0 replica answers every request with `order` (`order=asc`
+included) with `400 VALIDATION_FAILED` (`field: 'order'`), and `readings.csv` and
+`/vessels/:mmsi/devices` with `404 NOT_FOUND`. Switch the web app to `order=desc`, the CSV export
+and the devices list only once every telemetry replica runs 0.2.0.
+
+### Added
+
+- `order=asc|desc` on `GET /api/v2/telemetry/vessels/:mmsi/readings` (all buckets): `desc` pages
+  newest first, e.g. the newest readings with `order=desc&limit=20`, and its cursor continues
+  backwards. A cursor carries its order: one of the other order (or bucket) is
+  `400 VALIDATION_FAILED` (`field: 'cursor'`); cursors issued by 0.1.0 continue ascending.
+- `GET /api/v2/telemetry/vessels/:mmsi/readings.csv?from&to&bucket` (`telemetry:read`): the series
+  as one streamed RFC 4180 file (`text/csv; charset=utf-8; header=present`,
+  `Content-Disposition: attachment; filename="telemetry-<mmsi>-<bucket>-<from>_<to>.csv"`), with the
+  defaults and range limits of the series (raw ≤ 31 d, `1h` ≤ 366 d, `1d` ≤ 5 y), the columns of the
+  web app's export (`time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId`)
+  and the values of the JSON points. Read in keyset batches of 5 000 points as the client consumes
+  them; tenancy, permissions, range and the first batch are checked before the first byte (problem
+  details), a failure during the transfer aborts the connection (never a cut file that looks
+  complete). `Content-Disposition` is exposed cross-origin.
+- `GET /api/v2/telemetry/vessels/:mmsi/devices?page&pageSize` (`telemetry:read`): the devices the
+  vessel's organization registered on it, by name, read-only (`id`, `name`, `kind`, `status`,
+  `lastSeenAt`; no API key, serial number, MQTT topic or creator), so fleet managers see which
+  meters report without `device:manage`; the same devices `GET /telemetry/vessels` counts.
+- Methodology: `telemetry.reading_validation` (catalogued in contracts 0.4.0) tagged on
+  `readingViolations`, `batchViolations`, `repeatViolations` and `compareWithStored` and listed in
+  `IMPLEMENTED_METHOD_IDS`, so `GET /telemetry/methodology` describes all three methods.
+- Integration tests: a `FUEL` stream deleted at runtime is re-created by the next publish; readings
+  stay queued while a sealed `FUEL` stream rejects them and are relayed once it is replaced; the MQTT
+  round trip on the kit's MQTT-enabled test NATS; newest-first pages; the CSV export (values,
+  buckets, empty range, headers, CORS, problem details); the devices of a vessel (tenancy,
+  permissions, no credentials); path parameter errors; the catalogued methodology.
+
+### Changed
+
+- Dependencies: contracts `^0.4.0`, kit `^0.3.0`; `prom-client` removed (the metric types come from
+  `@darmawanweb/ais-its-nest/metrics`); `.pnpmfile.cjs` keeps the `@nestjs/terminus` optional gRPC
+  peers out of the production install (template hook), so the image holds no `testcontainers`,
+  `dockerode`, `ssh2`, `@grpc/grpc-js`, `protobufjs` or `@opentelemetry/sdk-node`.
+- Path parameters are parsed from the raw path segment by the kit's `@MmsiParam()` and
+  `@UuidParam()`. `:mmsi` must be exactly nine digits forming an MMSI: the segments that 0.1.0's
+  global `ValidationPipe` coerced with `+value` before the MMSI check (`0525005223`,
+  `525005223.0`, `%20525005223`, `5.25005223e8`, and `0x…`, which resolved to another MMSI:
+  `0x1F4A1D67` read vessel 524950887) now answer `400 VALIDATION_FAILED`
+  (`{ field: 'mmsi', code: 'isMmsi' }`). A malformed device id answers `400 VALIDATION_FAILED` with
+  `{ field: 'id', code: 'isUuid' }` (was the bare `400` of `ParseUUIDPipe`). `openapi.json`
+  documents both parameter schemas, the page maximum (1 000 000), the security schemes and the new
+  routes.
+- A `FUEL` stream deleted at runtime is re-created by the next publish (kit `EventPublisher`),
+  without a restart; before, every publish failed with "no responders" until the service restarted.
+- The service's own logs of database errors (publisher, relay, CSV export) are sanitized with the
+  kit's `sanitizeError` (no bound values); the kit sanitizes problem details and its own logs.
+- Kit 0.3 behaviour: a startup warning when the NATS `max_payload` is below 4 MiB and in production
+  while `TRUSTED_PROXIES` is the default (`.env.example` documents both); tracing exports traces
+  only; CORS exposes `ETag` and `Location`; database errors in problem details carry the driver's
+  primary message only.
+- Migrations are found through `MIGRATIONS_DIR` (resolved from the package, not the working
+  directory) by the service and `pnpm migrate`.
+
+### Removed
+
+- `src/db/errors.ts` (`pgErrorOf`, `isUniqueViolation`, the SQLSTATE constants) → the kit's
+  `databaseErrorInfo`, `isUniqueViolation` and `PG_SQLSTATES`.
+- `ParseMmsiPipe` and the MMSI bounds of `src/common/validation.ts` → kit `@MmsiParam()`,
+  contracts `MMSI_MIN` / `MMSI_MAX`; the `IfPresent` helpers of `update-device.dto.ts` → kit
+  `@IsOptionalNotNull()` (`null` for `mmsi`, `name`, `kind`, `status` still answers `400`).
+- The `event.type` narrowing of `src/consumers/fleet.consumer.ts`: `ConsumerEnvelope<'telemetry-fleet'>`
+  is exact, the switch is exhaustive.
+- The local `asDate` / `asNullableDate` of raw rows → kit `rowDate` / `rowDateOrNull`.
+- Test workarounds: the fresh `StreamManager` of `test/relay.int.test.ts` (the publisher re-creates
+  the stream; the cleanup uses `streams.ensure(['FUEL'], 'producer', { refresh: true })`) and the
+  hand-started `nats:2.11-alpine` MQTT container of `test/mqtt-gateway.int.test.ts`
+  (`testInfraGlobalSetup({ postgres: true, nats: { mqtt: true } })`, `testInfra('nats').nats.mqttUrl`).
+
 ## [0.1.0] - 2026-11-22
 
 ### Added
@@ -63,5 +144,6 @@ All notable changes to `ais-its-telemetry-service` are documented in this file. 
 - Readings are immutable and idempotent; the legacy update/delete endpoints have no v2 equivalent
   (see the README, legacy parity notes).
 
-[Unreleased]: https://github.com/DarmawanWeb/ais-its-telemetry-service/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/DarmawanWeb/ais-its-telemetry-service/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DarmawanWeb/ais-its-telemetry-service/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DarmawanWeb/ais-its-telemetry-service/releases/tag/v0.1.0

@@ -16,14 +16,19 @@ const HOUR_MS = 3_600_000;
 
 /**
  * Reliable publication: a reading stored while the FUEL stream cannot take
- * it (here: the stream is deleted, so JetStream has no responder) stays
- * queued with published_at = NULL, and the relay republishes it once the
- * stream is back and the grace period passed.
+ * it (here: the stream is sealed and rejects every message) stays queued
+ * with published_at = NULL, and the relay republishes it once the stream
+ * takes messages again and the grace period passed. A FUEL stream deleted at
+ * runtime is re-created by the next publish (kit ≥ 0.3), without a restart.
  */
 describe('publication relay', () => {
   let service: TestService;
   const orgId = newOrgId();
-  const [mmsi, otherMmsi] = uniqueMmsis(2) as [number, number];
+  const [mmsi, otherMmsi, recreatedMmsi] = uniqueMmsis(3) as [
+    number,
+    number,
+    number,
+  ];
   const time = new Date(Date.now() - 60_000).toISOString();
 
   const pending = async () =>
@@ -33,9 +38,16 @@ describe('publication relay', () => {
          FROM fuel_readings r
          JOIN fuel_readings_unpublished u ON u.mmsi = r.mmsi AND u.time = r.time
          WHERE r.mmsi = ANY($1)`,
-        [[mmsi, otherMmsi]],
+        [[mmsi, otherMmsi, recreatedMmsi]],
       )
     ).rows;
+
+  const jsm = async () =>
+    (await service.app.get(NatsClient).ready()).manager.streams;
+  /** A stream update: `sealed` is missing from the client's type, the server takes it. */
+  type StreamUpdate = NonNullable<
+    Parameters<Awaited<ReturnType<typeof jsm>>['update']>[1]
+  > & { sealed?: boolean };
 
   beforeAll(async () => {
     service = await startTestService({
@@ -47,28 +59,47 @@ describe('publication relay', () => {
     });
     await service.publishVessel({ mmsi, orgId });
     await service.publishVessel({ mmsi: otherMmsi, orgId });
+    await service.publishVessel({ mmsi: recreatedMmsi, orgId });
   });
 
-  /**
-   * Recreates the FUEL stream as a producer does at boot. The application's
-   * StreamManager ensures each stream once per process, so a fresh one is used.
-   */
-  const recreateFuelStream = async () => {
-    await new StreamManager(service.app.get(NatsClient)).ensure(
-      ['FUEL'],
-      'producer',
-    );
-  };
-
   afterAll(async () => {
-    // Leave the shared NATS with its FUEL stream for the next test files.
-    await recreateFuelStream();
+    // Leave the shared NATS with a writable FUEL stream for the next test
+    // files, also when a test failed half-way (sealed or missing stream).
+    const streams = await jsm();
+    const info = await streams.info('FUEL').catch(() => undefined);
+    if (info?.config.sealed === true) await streams.delete('FUEL');
+    await service.app
+      .get(StreamManager)
+      .ensure(['FUEL'], 'producer', { refresh: true });
     await service.close();
   });
 
+  it('re-creates a FUEL stream deleted at runtime on the next publish', async () => {
+    await (await jsm()).delete('FUEL');
+
+    const response = await service.app.inject({
+      method: 'POST',
+      url: '/api/v2/telemetry/readings',
+      headers: service.apiKey(orgId).headers,
+      payload: { mmsi: recreatedMmsi, time, fuelMeTon: 0.5, fuelAeTon: 0.05 },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({
+      received: 1,
+      accepted: 1,
+      duplicates: 0,
+      published: 1,
+    });
+    expect(await pending()).toEqual([]);
+    const [event] = await readFuelEvents(service.app, recreatedMmsi, 1);
+    expect(event?.msgId).toBe(`${recreatedMmsi}:${time}`);
+  });
+
   it('keeps readings queued while publishing fails and republishes them afterwards', async () => {
-    const { manager } = await service.app.get(NatsClient).ready();
-    await manager.streams.delete('FUEL');
+    // A sealed stream rejects every message with a JetStream error (not
+    // "no responders"), so neither the request nor the relay can publish.
+    const seal: StreamUpdate = { sealed: true };
+    await (await jsm()).update('FUEL', seal);
 
     const key = service.apiKey(orgId);
     const response = await service.app.inject({
@@ -94,11 +125,13 @@ describe('publication relay', () => {
       ]),
     );
 
-    // While the stream is missing the relay fails too: nothing is lost.
+    // While the stream rejects messages the relay fails too: nothing is lost.
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(await pending()).toHaveLength(2);
 
-    await recreateFuelStream();
+    // A sealed stream cannot be unsealed: delete it. The relay's next publish
+    // finds no stream, re-creates FUEL (the kit's publisher) and succeeds.
+    await (await jsm()).delete('FUEL');
     await waitFor(async () => (await pending()).length === 0, {
       timeoutMs: 15_000,
       message: 'relay did not republish',

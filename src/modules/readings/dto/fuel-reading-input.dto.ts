@@ -1,12 +1,9 @@
 import { parseIsoDateTime } from '@darmawanweb/ais-its-contracts/api';
+import { MMSI_MAX, MMSI_MIN } from '@darmawanweb/ais-its-contracts/domain';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsInt, IsNumber, IsOptional, Max, Min } from 'class-validator';
 
-import {
-  IsUtcDateTime,
-  MMSI_MAX,
-  MMSI_MIN,
-} from '../../../common/validation.js';
+import { IsUtcDateTime } from '../../../common/validation.js';
 import type { FuelReadingInput } from '../../../domain/fuel-reading.js';
 
 /** One reading of `POST /telemetry/readings`. */

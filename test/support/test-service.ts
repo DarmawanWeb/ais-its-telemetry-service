@@ -18,6 +18,7 @@ import {
   type ProviderOverride,
   startFakeApiKeyIntrospection,
   type TestJwtIssuer,
+  testInfra,
   type TestTokenClaims,
   uniqueName,
   waitFor,
@@ -29,7 +30,7 @@ import { inject } from 'vitest';
 import { AppModule } from '../../src/app.module.js';
 import { type Config, configSchema } from '../../src/config.js';
 import { OPENAPI } from '../../src/openapi.options.js';
-import { SERVICE } from '../../src/service.js';
+import { EXPOSED_HEADERS, SERVICE } from '../../src/service.js';
 
 /** `X-Internal-Token` shared by the service and the fake introspection. */
 const INTERNAL_TOKEN = 'test-internal-token-0123456789';
@@ -81,17 +82,17 @@ export interface TestServiceOptions {
 export async function startTestService(
   options: TestServiceOptions = {},
 ): Promise<TestService> {
-  const infra = inject('infra');
+  const { nats } = testInfra('nats');
   const jwt = await createTestJwtIssuer();
   const introspection = await startFakeApiKeyIntrospection({
     internalToken: INTERNAL_TOKEN,
   });
   const config = createTestConfig(configSchema, {
     SERVICE_NAME: SERVICE.name,
-    DATABASE_URL: infra.databaseUrl,
+    DATABASE_URL: inject('databaseUrl'),
     DATABASE_SCHEMA: SERVICE.schema,
     DB_MIGRATE_ON_BOOT: 'true',
-    NATS_URL: options.natsUrl ?? infra.natsUrl,
+    NATS_URL: options.natsUrl ?? nats.url,
     NATS_DURABLE_PREFIX: uniqueName('t'),
     AUTH_INTERNAL_URL: introspection.url,
     INTERNAL_TOKEN,
@@ -104,6 +105,7 @@ export async function startTestService(
   const app = await buildTestApp(AppModule, {
     config,
     openapi: OPENAPI,
+    cors: { exposedHeaders: EXPOSED_HEADERS },
     overrides: [
       { provide: ACCESS_TOKEN_KEY_RESOLVER, useValue: jwt.keyResolver },
       ...(options.overrides ?? []),

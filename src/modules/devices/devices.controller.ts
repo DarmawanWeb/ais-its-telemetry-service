@@ -4,7 +4,7 @@ import {
   type Principal,
   RequirePermissions,
 } from '@darmawanweb/ais-its-nest/auth';
-import { ApiPageResponse } from '@darmawanweb/ais-its-nest/http';
+import { ApiPageResponse, UuidParam } from '@darmawanweb/ais-its-nest/http';
 import {
   Body,
   Controller,
@@ -12,8 +12,6 @@ import {
   Get,
   HttpCode,
   HttpStatus,
-  Param,
-  ParseUUIDPipe,
   Patch,
   Post,
   Query,
@@ -82,7 +80,7 @@ export class DevicesController {
   @ApiOperation({ summary: 'Get a device' })
   @ApiOkResponse({ type: DeviceDto })
   async get(
-    @Param('id', new ParseUUIDPipe()) id: string,
+    @UuidParam() id: string,
     @CurrentPrincipal() principal: Principal,
   ): Promise<DeviceDto> {
     return new DeviceDto(await this.devices.get(id, principal));
@@ -97,7 +95,7 @@ export class DevicesController {
   })
   @ApiOkResponse({ type: DeviceDto })
   async update(
-    @Param('id', new ParseUUIDPipe()) id: string,
+    @UuidParam() id: string,
     @Body() body: UpdateDeviceDto,
     @CurrentPrincipal() principal: Principal,
     @Req() request: FastifyRequest,
@@ -113,7 +111,7 @@ export class DevicesController {
   @ApiOperation({ summary: 'Delete a device (its readings are kept)' })
   @ApiNoContentResponse()
   async remove(
-    @Param('id', new ParseUUIDPipe()) id: string,
+    @UuidParam() id: string,
     @CurrentPrincipal() principal: Principal,
     @Req() request: FastifyRequest,
   ): Promise<void> {

@@ -1,5 +1,6 @@
 import { EVENT_TYPES } from '@darmawanweb/ais-its-contracts/events';
 import { InjectConfig } from '@darmawanweb/ais-its-nest';
+import { sanitizeError } from '@darmawanweb/ais-its-nest/db';
 import { EventPublisher, NatsClient } from '@darmawanweb/ais-its-nest/nats';
 import { Injectable, Logger } from '@nestjs/common';
 
@@ -44,8 +45,9 @@ export class ReadingPublisher {
       await this.repository.markPublished(published);
     } catch (error) {
       // Published but not marked: the relay republishes them (deduplicated).
+      // A database error is logged without its bound values (the reading keys).
       this.logger.warn(
-        { err: error, readings: published.length },
+        { err: sanitizeError(error), readings: published.length },
         'Could not mark published readings; the relay will republish them',
       );
     }
@@ -79,7 +81,10 @@ export class ReadingPublisher {
       if (failure !== undefined) {
         const error: unknown = failure.reason;
         this.logger.warn(
-          { err: error, unpublished: readings.length - published.length },
+          {
+            err: sanitizeError(error),
+            unpublished: readings.length - published.length,
+          },
           'Publishing fuel readings failed; the relay will retry',
         );
         break;

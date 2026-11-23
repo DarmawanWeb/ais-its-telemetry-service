@@ -1,3 +1,5 @@
+import { Readable } from 'node:stream';
+
 import type { CursorPage, Paginated } from '@darmawanweb/ais-its-contracts/api';
 import {
   AllowApiKey,
@@ -8,6 +10,7 @@ import {
 import {
   ApiCursorResponse,
   ApiPageResponse,
+  MmsiParam,
   PageQueryDto,
   TimeRangeQueryDto,
 } from '@darmawanweb/ais-its-nest/http';
@@ -17,10 +20,10 @@ import {
   Get,
   HttpCode,
   HttpStatus,
-  Param,
   Post,
   Query,
   Req,
+  StreamableFile,
 } from '@nestjs/common';
 import {
   ApiAcceptedResponse,
@@ -28,13 +31,12 @@ import {
   ApiExtraModels,
   ApiOkResponse,
   ApiOperation,
-  ApiParam,
+  ApiProduces,
   ApiTags,
   getSchemaPath,
 } from '@nestjs/swagger';
 import type { FastifyRequest } from 'fastify';
 
-import { ParseMmsiPipe } from '../../common/validation.js';
 import { MAX_READINGS_PER_BATCH } from '../../domain/fuel-reading.js';
 import {
   FuelReadingInputDto,
@@ -42,17 +44,21 @@ import {
 } from './dto/fuel-reading-input.dto.js';
 import { IngestReadingsQuery, IngestResultDto } from './dto/ingest.dto.js';
 import { ParseReadingsBodyPipe } from './dto/parse-readings-body.pipe.js';
-import { FuelSeriesPointDto, FuelSeriesQuery } from './dto/series.dto.js';
+import {
+  FuelSeriesPointDto,
+  FuelSeriesQuery,
+  FuelSeriesRangeQuery,
+} from './dto/series.dto.js';
 import { TelemetryStatusDto } from './dto/status.dto.js';
 import { FuelSummaryDto } from './dto/summary.dto.js';
 import { TelemetryVesselDto } from './dto/telemetry-vessel.dto.js';
 import { ReadingsService } from './readings.service.js';
-
-const MMSI_PARAM = {
-  name: 'mmsi',
-  description: '9-digit MMSI',
-  example: 525005223,
-} as const;
+import {
+  SERIES_CSV_HEADER,
+  SERIES_CSV_MEDIA_TYPE,
+  seriesCsv,
+  seriesCsvFilename,
+} from './series-csv.js';
 
 /**
  * Fuel readings `/api/v2/telemetry` (spec §13.4): ingestion by API keys
@@ -136,14 +142,15 @@ export class ReadingsController {
   @ApiOperation({
     summary: 'Readings of a vessel, raw or as hourly / daily sums',
     description:
-      'Ascending in time; `[from, to)`; buckets whose start lies in the range. Hourly and daily sums come from the ' +
-      'continuous aggregates: readings stored more than an hour after their time (store and forward, imports) are ' +
-      'included after the next refresh (fuel_hourly every 15 min, fuel_daily hourly).',
+      'Time-ordered cursor pages: ascending by default, `order=desc` newest first (the newest readings: ' +
+      '`order=desc&limit=20`; `to` defaults to now, so pass a later `to` for readings up to ' +
+      'TELEMETRY_MAX_FUTURE_SKEW_MIN ahead of the server clock). `[from, to)`; buckets whose start lies in the range. ' +
+      'Hourly and daily sums come from the continuous aggregates: readings stored more than an hour after their time ' +
+      '(store and forward, imports) are included after the next refresh (fuel_hourly every 15 min, fuel_daily hourly).',
   })
-  @ApiParam(MMSI_PARAM)
   @ApiCursorResponse(FuelSeriesPointDto)
   async series(
-    @Param('mmsi', ParseMmsiPipe) mmsi: number,
+    @MmsiParam() mmsi: number,
     @Query() query: FuelSeriesQuery,
     @CurrentPrincipal() principal: Principal,
   ): Promise<CursorPage<FuelSeriesPointDto>> {
@@ -154,6 +161,49 @@ export class ReadingsController {
     };
   }
 
+  @Get('vessels/:mmsi/readings.csv')
+  @RequirePermissions('telemetry:read')
+  @ApiOperation({
+    summary: 'Export the readings or hourly / daily sums of a vessel as CSV',
+    description:
+      'The series of GET …/readings (same `from`, `to` and `bucket`, defaults and range limits; ascending) as one ' +
+      'streamed RFC 4180 file (`Content-Disposition: attachment`): the header line ' +
+      '`time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId`, CRLF line ends, the values of ' +
+      'the JSON points (empty for null; periodStart, source and deviceId only for raw readings). Errors before the ' +
+      'first byte are problem details; a failure during the transfer aborts the connection, so a cut file never ' +
+      'looks complete.',
+  })
+  @ApiProduces('text/csv')
+  @ApiOkResponse({
+    description: `CSV file with a header line (\`Content-Type: ${SERIES_CSV_MEDIA_TYPE}\`)`,
+    content: {
+      'text/csv': {
+        schema: { type: 'string' },
+        example: `${SERIES_CSV_HEADER}2026-11-21T10:15:00.000Z,,1.25,0.25,1.5,1,device,0192f3a4-5b6c-7d8e-9f01-23456789abcd\r\n`,
+      },
+    },
+  })
+  async exportCsv(
+    @MmsiParam() mmsi: number,
+    @Query() query: FuelSeriesRangeQuery,
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<StreamableFile> {
+    const exported = await this.readings.exportSeries(mmsi, query, principal);
+    const filename = seriesCsvFilename(
+      mmsi,
+      exported.bucket,
+      exported.from,
+      exported.to,
+    );
+    return new StreamableFile(
+      Readable.from(seriesCsv(exported.batches), { objectMode: false }),
+      {
+        type: SERIES_CSV_MEDIA_TYPE,
+        disposition: `attachment; filename="${filename}"`,
+      },
+    );
+  }
+
   @Get('vessels/:mmsi/summary')
   @RequirePermissions('telemetry:read')
   @ApiOperation({
@@ -162,10 +212,9 @@ export class ReadingsController {
       'Readings with time in `[from, to)` (default: the last 30 days, at most 5 years): whole UTC days from fuel_daily, ' +
       'whole hours from fuel_hourly, the edges from the raw readings (late readings: see the readings endpoint).',
   })
-  @ApiParam(MMSI_PARAM)
   @ApiOkResponse({ type: FuelSummaryDto })
   async summary(
-    @Param('mmsi', ParseMmsiPipe) mmsi: number,
+    @MmsiParam() mmsi: number,
     @Query() query: TimeRangeQueryDto,
     @CurrentPrincipal() principal: Principal,
   ): Promise<FuelSummaryDto> {
@@ -181,10 +230,9 @@ export class ReadingsController {
     description:
       'Active = newest reading at most TELEMETRY_ACTIVE_WINDOW_MIN minutes old.',
   })
-  @ApiParam(MMSI_PARAM)
   @ApiOkResponse({ type: TelemetryStatusDto })
   async status(
-    @Param('mmsi', ParseMmsiPipe) mmsi: number,
+    @MmsiParam() mmsi: number,
     @CurrentPrincipal() principal: Principal,
   ): Promise<TelemetryStatusDto> {
     return new TelemetryStatusDto(await this.readings.status(mmsi, principal));

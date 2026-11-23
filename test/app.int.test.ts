@@ -1,9 +1,7 @@
-import { fileURLToPath } from 'node:url';
-
 import { runMigrations } from '@darmawanweb/ais-its-nest/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { SERVICE } from '../src/service.js';
+import { MIGRATIONS_DIR, SERVICE } from '../src/service.js';
 import { startTestService, type TestService } from './support/test-service.js';
 
 const METHODOLOGY_URL = `/api/v2/${SERVICE.name}/methodology`;
@@ -113,7 +111,7 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
     const report = await runMigrations({
       pool: service.pool,
       schema: SERVICE.schema,
-      dir: fileURLToPath(new URL('../migrations', import.meta.url)),
+      dir: MIGRATIONS_DIR,
     });
 
     expect(report.applied.map((migration) => migration.version)).toEqual([2]);
@@ -155,7 +153,25 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ service: SERVICE.name });
+    const body = response.json<{
+      service: string;
+      methods: { id: string; catalogued: boolean; status: string }[];
+    }>();
+    expect(body.service).toBe(SERVICE.name);
+    // Every implemented id is catalogued (contracts 0.4 added reading_validation).
+    expect(
+      body.methods.map(({ id, catalogued, status }) => ({
+        id,
+        catalogued,
+        status,
+      })),
+    ).toEqual(
+      [
+        'fuel.method_selection',
+        'telemetry.fuel_reading_usage',
+        'telemetry.reading_validation',
+      ].map((id) => ({ id, catalogued: true, status: 'implemented' })),
+    );
   });
 
   it('documents its routes in /openapi.json', async () => {

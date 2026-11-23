@@ -11,6 +11,11 @@ import {
   assertOrgAccess,
   type Principal,
 } from '@darmawanweb/ais-its-nest/auth';
+import {
+  databaseErrorInfo,
+  isUniqueViolation,
+  PG_SQLSTATES,
+} from '@darmawanweb/ais-its-nest/db';
 import { Injectable } from '@nestjs/common';
 
 import {
@@ -21,12 +26,6 @@ import {
   VesselAccessDeniedError,
   VesselWithoutOrganizationError,
 } from '../../common/errors.js';
-import {
-  isUniqueViolation,
-  PG_CHECK_VIOLATION,
-  PG_NOT_NULL_VIOLATION,
-  pgErrorOf,
-} from '../../db/errors.js';
 import {
   tenantScopeOf,
   VesselAccessService,
@@ -123,6 +122,29 @@ export class DevicesService {
     const { rows, total } = await this.repository.list(
       filter,
       tenantScopeOf(principal),
+      { offset: pageOffset(page), limit: page.pageSize },
+    );
+    return toPaginated(rows, page, total);
+  }
+
+  /**
+   * The devices of a vessel the principal may read telemetry of (`telemetry:read`),
+   * by name: those of the vessel's current organization, as the telemetry
+   * overview counts them.
+   *
+   * @throws {VesselNotFoundError} `404` when the MMSI is not a live vessel.
+   * @throws {VesselAccessDeniedError} `403` for a vessel of another organization.
+   */
+  async listOfVessel(
+    mmsi: number,
+    page: PageQuery,
+    principal: Principal,
+  ): Promise<Paginated<Device>> {
+    const vessel = await this.vessels.accessibleOne(mmsi, principal);
+    if (vessel.orgId === null) return toPaginated([], page, 0);
+    const { rows, total } = await this.repository.listOfVessel(
+      vessel.orgId,
+      mmsi,
       { offset: pageOffset(page), limit: page.pageSize },
     );
     return toPaginated(rows, page, total);
@@ -237,20 +259,20 @@ export class DevicesService {
       ) {
         throw new DeviceApiKeyTakenError(apiKeyId, error);
       }
-      const pg = pgErrorOf(error);
+      const pg = databaseErrorInfo(error);
       if (
-        pg?.code === PG_CHECK_VIOLATION &&
+        pg?.code === PG_SQLSTATES.CHECK_VIOLATION &&
         pg.constraint === DEVICE_CREDENTIAL_CONSTRAINT
       ) {
         throw new DeviceCredentialConflictError(error);
       }
-      if (pg?.code === PG_NOT_NULL_VIOLATION) {
+      if (pg?.code === PG_SQLSTATES.NOT_NULL_VIOLATION) {
         const field = pg.column ?? 'body';
         throw new ValidationFailedError([
           { field, message: `${field} must not be null`, code: 'required' },
         ]);
       }
-      if (pg?.code === PG_CHECK_VIOLATION) {
+      if (pg?.code === PG_SQLSTATES.CHECK_VIOLATION) {
         throw new ValidationFailedError([
           {
             field: 'body',

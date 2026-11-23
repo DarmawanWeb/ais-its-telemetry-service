@@ -1,41 +1,49 @@
 import {
   provisionServiceSchema,
-  startTestInfra,
+  testInfra,
+  testInfraGlobalSetup,
 } from '@darmawanweb/ais-its-nest/testing';
 import type { TestProject } from 'vitest/node';
 
 import { SERVICE } from '../../src/service.js';
 
 /**
- * Starts TimescaleDB/PostGIS and NATS once for all integration test files,
- * provisions the service schema and role like `infra/postgres/bootstrap.sql`
- * and provides the endpoints (`inject('infra')`).
+ * TimescaleDB/PostGIS and NATS with JetStream and the MQTT gateway (as the
+ * platform's compose `nats` service) for all integration test files, started
+ * once; files read the endpoints with `testInfra('nats')`.
+ */
+const startInfra = testInfraGlobalSetup({
+  postgres: true,
+  nats: { mqtt: true },
+});
+
+/**
+ * Starts the shared containers, provisions the service schema and role like
+ * `infra/postgres/bootstrap.sql` and provides the service's `DATABASE_URL`
+ * (`inject('databaseUrl')`).
  */
 export async function setup(
   project: TestProject,
 ): Promise<() => Promise<void>> {
   // `test.env` does not reach the main process that runs this setup.
   process.env.TESTCONTAINERS_RYUK_DISABLED ??= 'true';
-  const infra = await startTestInfra({ postgres: true, nats: true });
+  const teardown = await startInfra();
   try {
-    const databaseUrl = await provisionServiceSchema(
-      infra.postgres.adminUrl,
-      SERVICE.schema,
+    const { postgres } = testInfra('postgres');
+    project.provide(
+      'databaseUrl',
+      await provisionServiceSchema(postgres.adminUrl, SERVICE.schema),
     );
-    project.provide('infra', { databaseUrl, natsUrl: infra.nats.url });
   } catch (error) {
-    await infra.stop();
+    await teardown();
     throw error;
   }
-  return () => infra.stop();
+  return teardown;
 }
 
 declare module 'vitest' {
   export interface ProvidedContext {
-    infra: {
-      /** `DATABASE_URL` of the service role. */
-      databaseUrl: string;
-      natsUrl: string;
-    };
+    /** `DATABASE_URL` of the service role `telemetry_svc`. */
+    databaseUrl: string;
   }
 }

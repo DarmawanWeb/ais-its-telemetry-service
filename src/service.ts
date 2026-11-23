@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import * as z from 'zod';
 
@@ -37,3 +38,19 @@ export const SERVICE = Object.freeze({
   /** The release version: package.json is its single source. */
   version: packageJson.version,
 });
+
+/**
+ * The migrations directory of this package, resolved from this module (not
+ * from the working directory), so the service and `pnpm migrate` find it
+ * wherever they are started (`dist/../migrations`, `src/../migrations`).
+ */
+export const MIGRATIONS_DIR = fileURLToPath(
+  new URL('../migrations', import.meta.url),
+);
+
+/**
+ * Response headers browsers may read cross-origin besides the kit's
+ * defaults (`X-Request-Id`, `Retry-After`, `WWW-Authenticate`, `ETag`,
+ * `Location`): the file name of the CSV export.
+ */
+export const EXPOSED_HEADERS: readonly string[] = ['Content-Disposition'];

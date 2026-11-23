@@ -17,6 +17,7 @@ import type {
   ApiKeyPrincipal,
   Principal,
 } from '@darmawanweb/ais-its-nest/auth';
+import { sanitizeError } from '@darmawanweb/ais-its-nest/db';
 import {
   cursorPage,
   decodeQueryCursor,
@@ -63,13 +64,25 @@ import type { FuelSummary } from './dto/summary.dto.js';
 import type { TelemetryVessel } from './dto/telemetry-vessel.dto.js';
 import type { IngestOutcome, NewReading } from './reading.js';
 import { ReadingIngestService } from './reading-ingest.service.js';
-import { ReadingsRepository, type SeriesPoint } from './readings.repository.js';
+import {
+  ReadingsRepository,
+  SERIES_ORDERS,
+  type SeriesOrder,
+  type SeriesPoint,
+} from './readings.repository.js';
 
-/** Position of a series page: the bucket and the time of its last point. */
+/**
+ * Position of a series page: the bucket, the order (absent in cursors of
+ * 0.1, which were all ascending) and the time of its last point.
+ */
 const SeriesCursorSchema = z.object({
   b: z.enum(FUEL_BUCKETS),
+  o: z.enum(SERIES_ORDERS).optional(),
   t: IsoDateTimeSchema,
 });
+
+/** Points per query of a CSV export (keyset batches, never one long statement). */
+export const SERIES_EXPORT_BATCH_SIZE = 5000;
 
 /** A time range query (`from` / `to` ISO-8601, optional). */
 export interface TimeRangeInput {
@@ -77,11 +90,28 @@ export interface TimeRangeInput {
   readonly to?: string | undefined;
 }
 
-/** A page query of a fuel series. */
-export interface SeriesPageInput extends TimeRangeInput {
+/** The range of a fuel series (pages and exports). */
+export interface SeriesRangeInput extends TimeRangeInput {
   readonly bucket: FuelBucket;
+}
+
+/** A page query of a fuel series. */
+export interface SeriesPageInput extends SeriesRangeInput {
+  readonly order: SeriesOrder;
   readonly cursor?: string | undefined;
   readonly limit: number;
+}
+
+/**
+ * A validated export of a vessel's fuel series: the resolved range and the
+ * points in ascending time order, fetched in batches as they are consumed.
+ */
+export interface SeriesExport {
+  readonly mmsi: number;
+  readonly bucket: FuelBucket;
+  readonly from: Date;
+  readonly to: Date;
+  readonly batches: AsyncIterable<readonly SeriesPoint[]>;
 }
 
 /** Provenance of a batch posted over REST. */
@@ -183,25 +213,27 @@ export class ReadingsService {
     };
   }
 
-  /** One page of a vessel's readings or bucket sums, ascending in time. */
+  /**
+   * One page of a vessel's readings or bucket sums in time order: oldest
+   * first (`asc`) or newest first (`desc`).
+   */
   async series(
     mmsi: number,
     query: SeriesPageInput,
     principal: Principal,
   ): Promise<CursorPage<SeriesPoint>> {
     await this.vessels.accessibleOne(mmsi, principal);
-    const range = SERIES_RANGES[query.bucket];
-    const { from, to } = resolveQueryTimeRange(query, {
-      defaultDurationMs: range.defaultMs,
-      maxDurationMs: range.maxMs,
-      now: this.clock.now(),
-    });
+    const { from, to } = this.seriesRange(query);
     const cursor = decodeQueryCursor(query, SeriesCursorSchema);
-    if (cursor !== undefined && cursor.b !== query.bucket) {
+    const cursorOrder = cursor?.o ?? 'asc';
+    if (
+      cursor !== undefined &&
+      (cursor.b !== query.bucket || cursorOrder !== query.order)
+    ) {
       throw new ValidationFailedError([
         {
           field: 'cursor',
-          message: `the cursor belongs to bucket=${cursor.b}`,
+          message: `the cursor belongs to bucket=${cursor.b}&order=${cursorOrder}`,
           code: 'isCursor',
         },
       ]);
@@ -211,13 +243,49 @@ export class ReadingsService {
       bucket: query.bucket,
       from,
       to,
+      order: query.order,
       after: cursor === undefined ? undefined : new Date(cursor.t),
       limit: query.limit + 1,
     });
     return cursorPage(rows, query.limit, (last) => ({
       b: query.bucket,
+      o: query.order,
       t: last.time.toISOString(),
     }));
+  }
+
+  /**
+   * Validates an export of a vessel's series (tenancy, the range limits of
+   * the bucket) and reads its first batch, so that every error of the
+   * request surfaces before the first byte is sent; the further batches are
+   * read as the consumer pulls them (keyset pagination by time, one short
+   * statement per {@link SERIES_EXPORT_BATCH_SIZE} points).
+   */
+  async exportSeries(
+    mmsi: number,
+    query: SeriesRangeInput,
+    principal: Principal,
+  ): Promise<SeriesExport> {
+    await this.vessels.accessibleOne(mmsi, principal);
+    const { from, to } = this.seriesRange(query);
+    const batch = (after: Date | undefined) =>
+      this.repository.series({
+        mmsi,
+        bucket: query.bucket,
+        from,
+        to,
+        order: 'asc',
+        after,
+        limit: SERIES_EXPORT_BATCH_SIZE,
+      });
+    const first = await batch(undefined);
+    return {
+      mmsi,
+      bucket: query.bucket,
+      from,
+      to,
+      batches: this.exportBatches(mmsi, first, batch),
+    };
   }
 
   /**
@@ -272,6 +340,47 @@ export class ReadingsService {
       page,
       total,
     );
+  }
+
+  /**
+   * The batches of an export: `first`, then one query after the last point
+   * of each full batch, until a batch comes back short. A failure while the
+   * response streams cannot become a problem response any more: it is logged
+   * without bound values and ends the stream with the sanitized error (the
+   * connection is aborted, so the client never takes a cut file as complete).
+   */
+  private async *exportBatches(
+    mmsi: number,
+    first: readonly SeriesPoint[],
+    next: (after: Date) => Promise<readonly SeriesPoint[]>,
+  ): AsyncGenerator<readonly SeriesPoint[]> {
+    let batch = first;
+    try {
+      for (;;) {
+        if (batch.length > 0) yield batch;
+        const last = batch.at(-1);
+        if (batch.length < SERIES_EXPORT_BATCH_SIZE || last === undefined)
+          return;
+        batch = await next(last.time);
+      }
+    } catch (error) {
+      const sanitized = sanitizeError(error);
+      this.logger.warn(
+        { err: sanitized, mmsi },
+        'Fuel series export failed while streaming; the download is aborted',
+      );
+      throw sanitized;
+    }
+  }
+
+  /** `[from, to)` of a series query with the defaults and limits of its bucket. */
+  private seriesRange(query: SeriesRangeInput): { from: Date; to: Date } {
+    const range = SERIES_RANGES[query.bucket];
+    return resolveQueryTimeRange(query, {
+      defaultDurationMs: range.defaultMs,
+      maxDurationMs: range.maxMs,
+      now: this.clock.now(),
+    });
   }
 
   private isActive(lastReadingAt: Date | null): boolean {

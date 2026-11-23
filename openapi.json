@@ -86,6 +86,7 @@
             "in": "query",
             "schema": {
               "minimum": 1,
+              "maximum": 1000000,
               "default": 1,
               "type": "integer"
             }
@@ -208,8 +209,10 @@
             "name": "id",
             "required": true,
             "in": "path",
+            "description": "UUID",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
@@ -251,8 +254,10 @@
             "name": "id",
             "required": true,
             "in": "path",
+            "description": "UUID",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
@@ -303,8 +308,10 @@
             "name": "id",
             "required": true,
             "in": "path",
+            "description": "UUID",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
@@ -329,6 +336,91 @@
         ],
         "x-required-permissions": [
           "device:manage"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels/{mmsi}/devices": {
+      "get": {
+        "description": "The devices the vessel’s organization registered on it, by name: id, name, kind, status and lastSeenAt, never credentials. The vessel must belong to the caller’s organization (platform administrators: any); the devices are those counted by GET /telemetry/vessels.",
+        "operationId": "VesselDevicesController_list",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 1000000,
+              "default": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "MMSI: exactly nine digits",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{9}$",
+              "example": "525005223"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/VesselDeviceDto"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/PageMetaDto"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Devices of a vessel (read-only)",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
         ]
       }
     },
@@ -427,6 +519,7 @@
             "in": "query",
             "schema": {
               "minimum": 1,
+              "maximum": 1000000,
               "default": 1,
               "type": "integer"
             }
@@ -491,19 +584,9 @@
     },
     "/api/v2/telemetry/vessels/{mmsi}/readings": {
       "get": {
-        "description": "Ascending in time; `[from, to)`; buckets whose start lies in the range. Hourly and daily sums come from the continuous aggregates: readings stored more than an hour after their time (store and forward, imports) are included after the next refresh (fuel_hourly every 15 min, fuel_daily hourly).",
+        "description": "Time-ordered cursor pages: ascending by default, `order=desc` newest first (the newest readings: `order=desc&limit=20`; `to` defaults to now, so pass a later `to` for readings up to TELEMETRY_MAX_FUTURE_SKEW_MIN ahead of the server clock). `[from, to)`; buckets whose start lies in the range. Hourly and daily sums come from the continuous aggregates: readings stored more than an hour after their time (store and forward, imports) are included after the next refresh (fuel_hourly every 15 min, fuel_daily hourly).",
         "operationId": "ReadingsController_series",
         "parameters": [
-          {
-            "name": "mmsi",
-            "required": true,
-            "in": "path",
-            "description": "9-digit MMSI",
-            "schema": {
-              "example": 525005223,
-              "type": "number"
-            }
-          },
           {
             "name": "cursor",
             "required": false,
@@ -559,6 +642,31 @@
                 "1d"
               ]
             }
+          },
+          {
+            "name": "order",
+            "required": false,
+            "in": "query",
+            "description": "`asc` oldest first (default) or `desc` newest first, e.g. the newest readings with `order=desc&limit=20`; the cursor continues in its own order (a cursor of the other order is a 400)",
+            "schema": {
+              "default": "asc",
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            }
+          },
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "MMSI: exactly nine digits",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{9}$",
+              "example": "525005223"
+            }
           }
         ],
         "responses": {
@@ -607,21 +715,11 @@
         ]
       }
     },
-    "/api/v2/telemetry/vessels/{mmsi}/summary": {
+    "/api/v2/telemetry/vessels/{mmsi}/readings.csv": {
       "get": {
-        "description": "Readings with time in `[from, to)` (default: the last 30 days, at most 5 years): whole UTC days from fuel_daily, whole hours from fuel_hourly, the edges from the raw readings (late readings: see the readings endpoint).",
-        "operationId": "ReadingsController_summary",
+        "description": "The series of GET …/readings (same `from`, `to` and `bucket`, defaults and range limits; ascending) as one streamed RFC 4180 file (`Content-Disposition: attachment`): the header line `time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId`, CRLF line ends, the values of the JSON points (empty for null; periodStart, source and deviceId only for raw readings). Errors before the first byte are problem details; a failure during the transfer aborts the connection, so a cut file never looks complete.",
+        "operationId": "ReadingsController_exportCsv",
         "parameters": [
-          {
-            "name": "mmsi",
-            "required": true,
-            "in": "path",
-            "description": "9-digit MMSI",
-            "schema": {
-              "example": 525005223,
-              "type": "number"
-            }
-          },
           {
             "name": "from",
             "required": false,
@@ -640,6 +738,101 @@
             "schema": {
               "format": "date-time",
               "type": "string"
+            }
+          },
+          {
+            "name": "bucket",
+            "required": false,
+            "in": "query",
+            "description": "`raw` readings (default range 24 h, at most 31 d), `1h` hourly sums (7 d, ≤ 366 d) or `1d` daily sums (365 d, ≤ 5 y); buckets are UTC and come from the continuous aggregates fuel_hourly / fuel_daily",
+            "schema": {
+              "default": "raw",
+              "type": "string",
+              "enum": [
+                "raw",
+                "1h",
+                "1d"
+              ]
+            }
+          },
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "MMSI: exactly nine digits",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{9}$",
+              "example": "525005223"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "CSV file with a header line (`Content-Type: text/csv; charset=utf-8; header=present`)",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "time,periodStart,fuelMeTon,fuelAeTon,totalFuelTon,readings,source,deviceId\r\n2026-11-21T10:15:00.000Z,,1.25,0.25,1.5,1,device,0192f3a4-5b6c-7d8e-9f01-23456789abcd\r\n"
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Export the readings or hourly / daily sums of a vessel as CSV",
+        "tags": [
+          "readings"
+        ],
+        "x-required-permissions": [
+          "telemetry:read"
+        ]
+      }
+    },
+    "/api/v2/telemetry/vessels/{mmsi}/summary": {
+      "get": {
+        "description": "Readings with time in `[from, to)` (default: the last 30 days, at most 5 years): whole UTC days from fuel_daily, whole hours from fuel_hourly, the edges from the raw readings (late readings: see the readings endpoint).",
+        "operationId": "ReadingsController_summary",
+        "parameters": [
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Start (ISO-8601); default: endpoint specific",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "End (ISO-8601); default: now",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "mmsi",
+            "required": true,
+            "in": "path",
+            "description": "MMSI: exactly nine digits",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{9}$",
+              "example": "525005223"
             }
           }
         ],
@@ -683,10 +876,11 @@
             "name": "mmsi",
             "required": true,
             "in": "path",
-            "description": "9-digit MMSI",
+            "description": "MMSI: exactly nine digits",
             "schema": {
-              "example": 525005223,
-              "type": "number"
+              "type": "string",
+              "pattern": "^[0-9]{9}$",
+              "example": "525005223"
             }
           }
         ],
@@ -725,7 +919,7 @@
   "info": {
     "title": "AIS Maritime Intelligence — AIS ITS Telemetry Service",
     "description": "Fuel consumption telemetry: readings ingest over REST and MQTT, device registry, queries and status; publishes fuel.reading.recorded.v1",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "contact": {}
   },
   "tags": [
@@ -824,7 +1018,9 @@
               "telemetry",
               "geo",
               "safety",
-              "surveillance"
+              "surveillance",
+              "notification",
+              "security"
             ],
             "nullable": true
           },
@@ -842,6 +1038,7 @@
             "enum": [
               "implemented",
               "planned",
+              "not_implemented",
               "deprecated"
             ],
             "nullable": true
@@ -1030,7 +1227,8 @@
         "properties": {
           "page": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "maximum": 1000000
           },
           "pageSize": {
             "type": "integer",
@@ -1090,6 +1288,48 @@
             "maxLength": 120
           }
         }
+      },
+      "VesselDeviceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Device id (the `deviceId` of its raw readings)"
+          },
+          "name": {
+            "type": "string",
+            "example": "ME flow meter"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mqtt",
+              "http"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "description": "Registry status: readings of inactive devices are rejected"
+          },
+          "lastSeenAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Last reading received from the device (updated at most once a minute)"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "status",
+          "lastSeenAt"
+        ]
       },
       "FuelReadingInputDto": {
         "type": "object",
