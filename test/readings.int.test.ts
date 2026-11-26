@@ -464,9 +464,17 @@ describe('fuel readings over REST', () => {
         url: `/api/v2/telemetry/devices/${device.id}`,
         headers: admin,
       });
-      expect(
-        seen.json<{ lastSeenAt: string | null }>().lastSeenAt,
-      ).not.toBeNull();
+      const seenBody = seen.json<{
+        lastSeenAt: string | null;
+        lastReadingAt: string | null;
+        connectionState: string;
+      }>();
+      expect(seenBody.lastSeenAt).not.toBeNull();
+      // Received now, measured 11 minutes ago: beyond the 10-minute active window.
+      expect(seenBody).toMatchObject({
+        lastReadingAt: minutesAgo(11),
+        connectionState: 'idle',
+      });
 
       const mismatch = await post(
         { mmsi: vesselA2, time: minutesAgo(12), fuelMeTon: 1, fuelAeTon: 0 },

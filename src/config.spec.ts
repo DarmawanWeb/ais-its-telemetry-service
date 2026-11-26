@@ -40,7 +40,11 @@ describe('configSchema', () => {
       TELEMETRY_MAX_PERIOD_H: 24,
       TELEMETRY_RELAY_INTERVAL_MS: 5000,
       TELEMETRY_RELAY_AFTER_S: 30,
+      TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: 1440,
+      // The development broker of infra/compose; its authentication follows NODE_ENV.
+      TELEMETRY_MQTT_URL: 'mqtt://localhost:1883',
     });
+    expect(config.TELEMETRY_MQTT_AUTH).toBeUndefined();
     expect(readingLimitsOf(config)).toEqual({
       maxFuelMeTon: 500,
       maxFuelAeTon: 100,
@@ -78,6 +82,52 @@ describe('configSchema', () => {
       PORT: 4000,
       NATS_URL: ['nats://a:4222', 'nats://b:4222'],
     });
+  });
+
+  it('keeps the offline threshold of devices at or beyond the active window', () => {
+    expect(
+      load({
+        TELEMETRY_ACTIVE_WINDOW_MIN: '30',
+        TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '30',
+      }).TELEMETRY_DEVICE_OFFLINE_AFTER_MIN,
+    ).toBe(30);
+    expect(() =>
+      load({
+        TELEMETRY_ACTIVE_WINDOW_MIN: '30',
+        TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '29',
+      }),
+    ).toThrow(
+      /TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: Must be at least TELEMETRY_ACTIVE_WINDOW_MIN \(30\)/,
+    );
+    expect(() => load({ TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '0' })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  it('accepts a bare mqtt:// or mqtts:// broker URL and an authentication mode', () => {
+    expect(
+      load({
+        TELEMETRY_MQTT_URL: 'mqtts://mqtt.example.org:8883',
+        TELEMETRY_MQTT_AUTH: 'password',
+      }),
+    ).toMatchObject({
+      TELEMETRY_MQTT_URL: 'mqtts://mqtt.example.org:8883',
+      TELEMETRY_MQTT_AUTH: 'password',
+    });
+    for (const url of [
+      'https://mqtt.example.org',
+      'mqtts://device:secret@mqtt.example.org',
+      'mqtts://mqtt.example.org/mqtt',
+      'mqtts://mqtt.example.org?tls=1',
+      'mqtt.example.org:8883',
+    ]) {
+      expect(() => load({ TELEMETRY_MQTT_URL: url }), url).toThrow(
+        ConfigValidationError,
+      );
+    }
+    expect(() => load({ TELEMETRY_MQTT_AUTH: 'jwt' })).toThrow(
+      ConfigValidationError,
+    );
   });
 
   it('refuses invalid values', () => {

@@ -75,6 +75,21 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
   const outcome = (name: string) =>
     metricValue(service.app, DEVICE_MESSAGES, { outcome: name });
 
+  /** The device as the registry shows it. */
+  const registered = async (deviceId: string) => {
+    const response = await service.app.inject({
+      method: 'GET',
+      url: `/api/v2/telemetry/devices/${deviceId}`,
+      headers: admin,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    return response.json<{
+      lastSeenAt: string | null;
+      lastReadingAt: string | null;
+      connectionState: string;
+    }>();
+  };
+
   /** Sends a message and waits until its outcome was counted. */
   const sendAndCount = async (
     name: string,
@@ -182,14 +197,13 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
       source: 'mqtt',
     });
 
-    const device = await service.app.inject({
-      method: 'GET',
-      url: `/api/v2/telemetry/devices/${devices.meter}`,
-      headers: admin,
+    const device = await registered(devices.meter);
+    expect(device.lastSeenAt).not.toBeNull();
+    // Measured 2 minutes ago: within the 10-minute active window.
+    expect(device).toMatchObject({
+      lastReadingAt: time,
+      connectionState: 'online',
     });
-    expect(
-      device.json<{ lastSeenAt: string | null }>().lastSeenAt,
-    ).not.toBeNull();
   });
 
   it('accepts store-and-forward arrays and ignores repeated messages', async () => {
@@ -202,6 +216,10 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
 
     await sendAndCount('duplicate', devices.meter, batch);
     expect(await storedReadings(devices.meter)).toHaveLength(3);
+    // Older readings forwarded later never move lastReadingAt back.
+    expect((await registered(devices.meter)).lastReadingAt).toBe(
+      (await storedReadings(devices.meter)).at(-1)?.time.toISOString(),
+    );
     expect(
       await metricValue(service.app, 'aisits_telemetry_readings_total', {
         source: 'mqtt',
@@ -317,6 +335,13 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
       fuelAeTon: 0.3,
     });
     expect(await storedReadings(aeMeter)).toEqual([]);
+    // It delivered, but none of its readings is stored: no reading yet.
+    const refused = await registered(aeMeter);
+    expect(refused.lastSeenAt).not.toBeNull();
+    expect(refused).toMatchObject({
+      lastReadingAt: null,
+      connectionState: 'never',
+    });
 
     // Store and forward: the conflicting reading is left out, the rest is kept.
     const next = minutesAgo(44);
@@ -327,6 +352,11 @@ describe('device messages on aisits.telemetry.<deviceId>', () => {
     expect(
       (await storedReadings(aeMeter)).map((row) => row.time.toISOString()),
     ).toEqual([next]);
+    // Its stored reading; the conflicting one at `time` is the other meter's.
+    expect(await registered(aeMeter)).toMatchObject({
+      lastReadingAt: next,
+      connectionState: 'idle',
+    });
     expect(
       await metricValue(service.app, 'aisits_telemetry_readings_total', {
         source: 'mqtt',

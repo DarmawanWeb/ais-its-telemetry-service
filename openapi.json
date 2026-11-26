@@ -78,6 +78,7 @@
         ]
       },
       "get": {
+        "description": "Each device with the name of its vessel (FLEET projection), lastSeenAt (receipt) and lastReadingAt (measurement time of its newest reading), and its connectionState with the thresholds that define it (activeWindowMin, offlineAfterMin).",
         "operationId": "DevicesController_list",
         "parameters": [
           {
@@ -331,6 +332,53 @@
           }
         },
         "summary": "Delete a device (its readings are kept)",
+        "tags": [
+          "devices"
+        ],
+        "x-required-permissions": [
+          "device:manage"
+        ]
+      }
+    },
+    "/api/v2/telemetry/devices/{id}/connection": {
+      "get": {
+        "description": "How the device connects to the platform broker (TELEMETRY_MQTT_URL: URL, host, port, TLS, MQTT 3.1.1) and publishes (its own topic, QoS 1), and how the broker authenticates it (TELEMETRY_MQTT_AUTH): without authentication any client may publish; with password authentication the device logs in as its own broker user (username = device id), whose password the platform operator provisions with the broker. No secret is issued or returned. 404 for devices of other organizations; 409 DEVICE_NOT_MQTT for http devices, which post with their API key.",
+        "operationId": "DevicesController_connection",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "description": "UUID",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceConnectionDto"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Problem details (RFC 9457)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "summary": "MQTT connection of an mqtt device",
         "tags": [
           "devices"
         ],
@@ -1151,6 +1199,12 @@
             "example": 525005223,
             "description": "Vessel the device is installed on"
           },
+          "vesselName": {
+            "type": "string",
+            "nullable": true,
+            "example": "KM Sinar Bahari",
+            "description": "Name of the vessel (FLEET projection); null while the MMSI is not a live vessel of the fleet"
+          },
           "name": {
             "type": "string",
             "example": "ME flow meter"
@@ -1190,7 +1244,34 @@
             "type": "string",
             "format": "date-time",
             "nullable": true,
-            "description": "Last readings received from the device (minute resolution)"
+            "description": "When the device last delivered readings (receipt time, minute resolution)"
+          },
+          "lastReadingAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Measurement time of the newest reading stored as the device’s (minute resolution, written with lastSeenAt; never moves back)"
+          },
+          "connectionState": {
+            "type": "string",
+            "enum": [
+              "online",
+              "idle",
+              "offline",
+              "never",
+              "inactive"
+            ],
+            "description": "inactive: switched off (readings refused); never: no reading yet; online: newest reading at most activeWindowMin old (the vessel telemetry \"active\" rule, method fuel.method_selection); idle: older, up to offlineAfterMin; offline: older than offlineAfterMin"
+          },
+          "activeWindowMin": {
+            "type": "number",
+            "example": 10,
+            "description": "Age of the newest reading up to which the device is online, minutes (TELEMETRY_ACTIVE_WINDOW_MIN)"
+          },
+          "offlineAfterMin": {
+            "type": "number",
+            "example": 1440,
+            "description": "Age of the newest reading beyond which the device is offline, minutes (TELEMETRY_DEVICE_OFFLINE_AFTER_MIN)"
           },
           "createdBy": {
             "type": "string",
@@ -1210,6 +1291,7 @@
           "id",
           "orgId",
           "mmsi",
+          "vesselName",
           "name",
           "kind",
           "apiKeyId",
@@ -1217,6 +1299,10 @@
           "serialNumber",
           "mqttTopic",
           "lastSeenAt",
+          "lastReadingAt",
+          "connectionState",
+          "activeWindowMin",
+          "offlineAfterMin",
           "createdBy",
           "createdAt",
           "updatedAt"
@@ -1245,6 +1331,77 @@
           "page",
           "pageSize",
           "total"
+        ]
+      },
+      "DeviceConnectionDto": {
+        "type": "object",
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "brokerUrl": {
+            "type": "string",
+            "example": "mqtts://mqtt.example.org:8883",
+            "description": "The platform broker as devices reach it (TELEMETRY_MQTT_URL, port explicit): mqtts = TLS"
+          },
+          "host": {
+            "type": "string",
+            "example": "mqtt.example.org"
+          },
+          "port": {
+            "type": "number",
+            "example": 8883
+          },
+          "tls": {
+            "type": "boolean",
+            "description": "The broker requires TLS (an mqtts:// broker URL)"
+          },
+          "protocolVersion": {
+            "type": "string",
+            "enum": [
+              "3.1.1"
+            ],
+            "description": "MQTT version to connect with (protocol level 4): the NATS MQTT gateway implements MQTT 3.1.1, not MQTT 5"
+          },
+          "topic": {
+            "type": "string",
+            "example": "aisits/telemetry/0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77",
+            "description": "The topic the device publishes its readings to (only its own)"
+          },
+          "qos": {
+            "type": "number",
+            "enum": [
+              1
+            ],
+            "description": "QoS to publish with: at least once (QoS 0 messages sent just before a disconnect can be lost; repeats are stored once)"
+          },
+          "authentication": {
+            "type": "string",
+            "enum": [
+              "none",
+              "password"
+            ],
+            "description": "none: the broker accepts any client (development); password: the device logs in as its own broker user, whose password the platform operator provisions (never issued or returned by this API)"
+          },
+          "username": {
+            "type": "string",
+            "nullable": true,
+            "example": "0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77",
+            "description": "The device’s broker user (its id) under password authentication; null without authentication"
+          }
+        },
+        "required": [
+          "deviceId",
+          "brokerUrl",
+          "host",
+          "port",
+          "tls",
+          "protocolVersion",
+          "topic",
+          "qos",
+          "authentication",
+          "username"
         ]
       },
       "UpdateDeviceDto": {
@@ -1320,7 +1477,7 @@
             "type": "string",
             "format": "date-time",
             "nullable": true,
-            "description": "Last reading received from the device (updated at most once a minute)"
+            "description": "When the device last delivered readings (receipt time, minute resolution)"
           }
         },
         "required": [

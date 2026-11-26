@@ -37,7 +37,7 @@ export class VesselDeviceDto {
     format: 'date-time',
     nullable: true,
     description:
-      'Last reading received from the device (updated at most once a minute)',
+      'When the device last delivered readings (receipt time, minute resolution)',
   })
   readonly lastSeenAt: string | null;
 

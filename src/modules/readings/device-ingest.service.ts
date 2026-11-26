@@ -166,7 +166,7 @@ export class DeviceIngestService {
         'skip',
       ),
     );
-    await this.devices.markSeen(device.id, now);
+    await this.devices.markSeen(device.id, now, result.latest);
     if (result.conflicts > 0) {
       this.logger.warn(
         {

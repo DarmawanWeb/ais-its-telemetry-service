@@ -6,6 +6,7 @@ import {
   dedupeReadings,
   type FuelReadingSource,
   groupByStorageWindow,
+  readingKey,
 } from '../../domain/fuel-reading.js';
 import type {
   ConflictPolicy,
@@ -39,13 +40,19 @@ export class ReadingIngestService {
   async ingest(
     batch: IngestBatch,
     policy: ConflictPolicy,
-  ): Promise<IngestOutcome & { readonly conflicts: number }> {
+  ): Promise<
+    IngestOutcome & {
+      readonly conflicts: number;
+      readonly latest: Date | null;
+    }
+  > {
     const outcome = await this.store(batch, policy);
     return {
       received: outcome.received,
       accepted: outcome.stored.length,
       duplicates: outcome.duplicates,
       conflicts: outcome.conflicts.length,
+      latest: outcome.latest,
       published: await this.publish(outcome.stored),
     };
   }
@@ -91,7 +98,7 @@ export class ReadingIngestService {
       );
       if (conflicts.length > 0) {
         this.count(batch.source, { conflicts });
-        return { ...outcome, conflicts, rejected: true };
+        return { ...outcome, conflicts, rejected: true, latest: null };
       }
     }
 
@@ -103,9 +110,13 @@ export class ReadingIngestService {
       outcome.stored.push(...result.stored);
       outcome.duplicates += result.duplicates.length;
       outcome.conflicts.push(...result.conflicts);
-      if (result.rejected) return { ...outcome, rejected: true };
+      if (result.rejected) return { ...outcome, rejected: true, latest: null };
     }
-    return { ...outcome, rejected: false };
+    return {
+      ...outcome,
+      rejected: false,
+      latest: newestHeld(readings, outcome.conflicts),
+    };
   }
 
   /**
@@ -141,4 +152,22 @@ export class ReadingIngestService {
       );
     }
   }
+}
+
+/**
+ * The measurement time of the newest of `readings` that is not among
+ * `conflicts` (so it is stored with the batch's provenance: new or a
+ * duplicate), `null` when every reading conflicted.
+ */
+function newestHeld(
+  readings: readonly NewReading[],
+  conflicts: readonly NewReading[],
+): Date | null {
+  const conflicting = new Set(conflicts.map(readingKey));
+  let newest: Date | null = null;
+  for (const reading of readings) {
+    if (conflicting.has(readingKey(reading))) continue;
+    if (newest === null || reading.time > newest) newest = reading.time;
+  }
+  return newest;
 }

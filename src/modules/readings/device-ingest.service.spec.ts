@@ -39,6 +39,7 @@ const mqttDevice = (overrides: Partial<Device> = {}): Device => ({
   status: 'active',
   serialNumber: null,
   lastSeenAt: null,
+  lastReadingAt: null,
   createdBy: null,
   createdAt: NOW,
   updatedAt: NOW,
@@ -77,6 +78,7 @@ describe('DeviceIngestService', () => {
       accepted: 1,
       duplicates: 0,
       conflicts: 0,
+      latest: new Date(READING.time),
       published: 1,
     });
     metrics = new TelemetryMetrics(new MetricsService());
@@ -112,7 +114,12 @@ describe('DeviceIngestService', () => {
       // MQTT has no one to answer: conflicting readings are left out, the rest is stored.
       'skip',
     );
-    expect(markSeen).toHaveBeenCalledWith(DEVICE_ID, NOW);
+    // Receipt now, measured at the newest reading the store holds for the device.
+    expect(markSeen).toHaveBeenCalledWith(
+      DEVICE_ID,
+      NOW,
+      new Date(READING.time),
+    );
     expect(await counted('accepted')).toBe(1);
   });
 
@@ -122,6 +129,7 @@ describe('DeviceIngestService', () => {
       accepted: 0,
       duplicates: 1,
       conflicts: 0,
+      latest: new Date(READING.time),
       published: 0,
     });
     await expect(service.handle(SUBJECT, body(READING))).resolves.toBe(
@@ -135,12 +143,17 @@ describe('DeviceIngestService', () => {
       accepted: 1,
       duplicates: 0,
       conflicts: 1,
+      latest: new Date(READING.time),
       published: 1,
     });
     await expect(
       service.handle(SUBJECT, body([READING, { ...READING, time: NOW }])),
     ).resolves.toBe('conflict');
-    expect(markSeen).toHaveBeenCalledWith(DEVICE_ID, NOW);
+    expect(markSeen).toHaveBeenCalledWith(
+      DEVICE_ID,
+      NOW,
+      new Date(READING.time),
+    );
     expect(await counted('conflict')).toBe(1);
   });
 

@@ -192,7 +192,7 @@ export class ReadingsService {
     }
 
     if (attribution.deviceId !== null)
-      await this.devices.markSeen(attribution.deviceId, now);
+      await this.devices.markSeen(attribution.deviceId, now, outcome.latest);
     const [published] = await Promise.all([
       this.ingestion.publish(outcome.stored),
       principal.kind === 'user'

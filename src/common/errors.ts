@@ -85,6 +85,21 @@ export class DeviceVesselMismatchError extends ForbiddenError {
   }
 }
 
+/**
+ * `409 DEVICE_NOT_MQTT`: MQTT connection details of an `http` device, which
+ * posts its readings with its API key instead.
+ */
+export class DeviceNotMqttError extends ConflictError {
+  override readonly name = 'DeviceNotMqttError';
+
+  constructor(deviceId: string) {
+    super(
+      `Device ${deviceId} is an http device: it posts readings to POST /api/v2/telemetry/readings with its API key and has no MQTT connection`,
+      { code: 'DEVICE_NOT_MQTT', extra: { deviceId } },
+    );
+  }
+}
+
 /** `409 DEVICE_NAME_TAKEN`: the organization already has a device of that name. */
 export class DeviceNameTakenError extends ConflictError {
   override readonly name = 'DeviceNameTakenError';

@@ -64,14 +64,19 @@ describe('rolling update from 0.1.0', () => {
   // forbids unknown properties: every request with `order` (asc included) is a
   // 400 there, and the routes added in 0.2.0 are a 404. A newest-first cursor
   // never reaches a 0.1.0 replica "as ascending": 0.2.0 itself refuses it
-  // without `order=desc`.
+  // without `order=desc`. Migration 0003 is recorded but has no file on 0.1.0
+  // (its migrator only warns), and 0.1.0 does not write `last_reading_at`.
   const facts = [
     '`order=asc` included',
     '`400 VALIDATION_FAILED`',
     "field: 'order'",
     'readings.csv',
     '/vessels/:mmsi/devices',
+    '/devices/:id/connection',
     '`404 NOT_FOUND`',
+    '0003',
+    'recorded migration has no file',
+    '`lastReadingAt`',
     'only once every telemetry replica runs 0.2.0',
   ];
 

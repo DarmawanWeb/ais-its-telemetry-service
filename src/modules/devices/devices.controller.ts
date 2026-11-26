@@ -29,6 +29,7 @@ import type { FastifyRequest } from 'fastify';
 import { DevicesService } from './devices.service.js';
 import { CreateDeviceDto } from './dto/create-device.dto.js';
 import { DeviceDto } from './dto/device.dto.js';
+import { DeviceConnectionDto } from './dto/device-connection.dto.js';
 import { ListDevicesQuery } from './dto/list-devices.query.js';
 import { UpdateDeviceDto } from './dto/update-device.dto.js';
 
@@ -57,7 +58,12 @@ export class DevicesController {
 
   @Get()
   @RequirePermissions('device:manage')
-  @ApiOperation({ summary: 'List devices by vessel and name' })
+  @ApiOperation({
+    summary: 'List devices by vessel and name',
+    description:
+      'Each device with the name of its vessel (FLEET projection), lastSeenAt (receipt) and lastReadingAt (measurement time of its ' +
+      'newest reading), and its connectionState with the thresholds that define it (activeWindowMin, offlineAfterMin).',
+  })
   @ApiPageResponse(DeviceDto)
   async list(
     @Query() query: ListDevicesQuery,
@@ -84,6 +90,27 @@ export class DevicesController {
     @CurrentPrincipal() principal: Principal,
   ): Promise<DeviceDto> {
     return new DeviceDto(await this.devices.get(id, principal));
+  }
+
+  @Get(':id/connection')
+  @RequirePermissions('device:manage')
+  @ApiOperation({
+    summary: 'MQTT connection of an mqtt device',
+    description:
+      'How the device connects to the platform broker (TELEMETRY_MQTT_URL: URL, host, port, TLS, MQTT 3.1.1) and publishes ' +
+      '(its own topic, QoS 1), and how the broker authenticates it (TELEMETRY_MQTT_AUTH): without authentication any client ' +
+      'may publish; with password authentication the device logs in as its own broker user (username = device id), whose ' +
+      'password the platform operator provisions with the broker. No secret is issued or returned. 404 for devices of other ' +
+      'organizations; 409 DEVICE_NOT_MQTT for http devices, which post with their API key.',
+  })
+  @ApiOkResponse({ type: DeviceConnectionDto })
+  async connection(
+    @UuidParam() id: string,
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<DeviceConnectionDto> {
+    return new DeviceConnectionDto(
+      await this.devices.connection(id, principal),
+    );
   }
 
   @Patch(':id')
