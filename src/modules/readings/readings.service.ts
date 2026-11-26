@@ -53,6 +53,7 @@ import {
   type UserReadingSource,
 } from '../../domain/fuel-reading.js';
 import { isTelemetryActive } from '../../domain/telemetry-status.js';
+import type { Device } from '../devices/device.js';
 import { DevicesService } from '../devices/devices.service.js';
 import {
   tenantScopeOf,
@@ -117,7 +118,8 @@ export interface SeriesExport {
 /** Provenance of a batch posted over REST. */
 interface Attribution {
   readonly source: FuelReadingSource;
-  readonly deviceId: string | null;
+  /** The device the readings are attributed to (source `device`) and its vessel, else `null`. */
+  readonly device: Pick<Device, 'id' | 'mmsi'> | null;
 }
 
 /**
@@ -178,21 +180,25 @@ export class ReadingsService {
     const attribution =
       principal.kind === 'api_key'
         ? await this.attributeApiKey(principal, readings, requestedSource)
-        : { source: requestedSource ?? 'manual', deviceId: null };
+        : { source: requestedSource ?? 'manual', device: null };
     const vessels = await this.vessels.accessible(
       readings.map((reading) => reading.mmsi),
       principal,
     );
     const outcome = await this.ingestion.store(
-      { readings, ...attribution },
+      {
+        readings,
+        source: attribution.source,
+        deviceId: attribution.device?.id ?? null,
+      },
       'reject',
     );
     if (outcome.rejected) {
       throw new ReadingConflictError(conflictsOf(readings, outcome.conflicts));
     }
 
-    if (attribution.deviceId !== null)
-      await this.devices.markSeen(attribution.deviceId, now);
+    if (attribution.device !== null)
+      await this.devices.markSeen(attribution.device, now, outcome.latest);
     const [published] = await Promise.all([
       this.ingestion.publish(outcome.stored),
       principal.kind === 'user'
@@ -412,7 +418,7 @@ export class ReadingsService {
       ]);
     }
     const device = await this.devices.deviceOfApiKey(principal);
-    if (device === undefined) return { source: 'api', deviceId: null };
+    if (device === undefined) return { source: 'api', device: null };
     if (device.status !== 'active') throw new DeviceInactiveError(device.id);
     const foreign = [
       ...new Set(
@@ -423,7 +429,7 @@ export class ReadingsService {
     ];
     if (foreign.length > 0)
       throw new DeviceVesselMismatchError(device.id, device.mmsi, foreign);
-    return { source: 'device', deviceId: device.id };
+    return { source: 'device', device };
   }
 
   /**

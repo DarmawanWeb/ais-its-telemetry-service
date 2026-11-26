@@ -13,6 +13,22 @@ function load(env: Record<string, string> = {}) {
   });
 }
 
+/**
+ * The problems `loadConfig` reports for `TELEMETRY_MQTT_URL=url` next to an
+ * invalid `PORT`, sorted (`PORT` first): the report lists every variable.
+ */
+function problems(url: string): string[] {
+  try {
+    load({ TELEMETRY_MQTT_URL: url, PORT: 'eighty' });
+  } catch (error) {
+    if (!(error instanceof ConfigValidationError)) throw error;
+    return error.issues
+      .map((issue) => `${issue.variable}: ${issue.message}`)
+      .sort();
+  }
+  throw new Error(`PORT=eighty was accepted with ${url}`);
+}
+
 describe('configSchema', () => {
   it('applies the service defaults (spec §3, §4, §6)', () => {
     const config = load();
@@ -40,7 +56,11 @@ describe('configSchema', () => {
       TELEMETRY_MAX_PERIOD_H: 24,
       TELEMETRY_RELAY_INTERVAL_MS: 5000,
       TELEMETRY_RELAY_AFTER_S: 30,
+      TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: 1440,
+      // The development broker of infra/compose; its authentication follows NODE_ENV.
+      TELEMETRY_MQTT_URL: 'mqtt://localhost:1883',
     });
+    expect(config.TELEMETRY_MQTT_AUTH).toBeUndefined();
     expect(readingLimitsOf(config)).toEqual({
       maxFuelMeTon: 500,
       maxFuelAeTon: 100,
@@ -78,6 +98,103 @@ describe('configSchema', () => {
       PORT: 4000,
       NATS_URL: ['nats://a:4222', 'nats://b:4222'],
     });
+  });
+
+  it('keeps the offline threshold of devices at or beyond the active window', () => {
+    expect(
+      load({
+        TELEMETRY_ACTIVE_WINDOW_MIN: '30',
+        TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '30',
+      }).TELEMETRY_DEVICE_OFFLINE_AFTER_MIN,
+    ).toBe(30);
+    expect(() =>
+      load({
+        TELEMETRY_ACTIVE_WINDOW_MIN: '30',
+        TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '29',
+      }),
+    ).toThrow(
+      /TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: Must be at least TELEMETRY_ACTIVE_WINDOW_MIN \(30\)/,
+    );
+    expect(() => load({ TELEMETRY_DEVICE_OFFLINE_AFTER_MIN: '0' })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  it('accepts a bare mqtt:// or mqtts:// broker URL and an authentication mode', () => {
+    expect(
+      load({
+        TELEMETRY_MQTT_URL: 'mqtts://mqtt.example.org:8883',
+        TELEMETRY_MQTT_AUTH: 'password',
+      }),
+    ).toMatchObject({
+      TELEMETRY_MQTT_URL: 'mqtts://mqtt.example.org:8883',
+      TELEMETRY_MQTT_AUTH: 'password',
+    });
+    for (const url of [
+      'https://mqtt.example.org',
+      'mqtts://device:secret@mqtt.example.org',
+      'mqtts://mqtt.example.org/mqtt',
+      'mqtts://mqtt.example.org?tls=1',
+      'mqtt.example.org:8883',
+    ]) {
+      expect(() => load({ TELEMETRY_MQTT_URL: url }), url).toThrow(
+        ConfigValidationError,
+      );
+    }
+    expect(() => load({ TELEMETRY_MQTT_AUTH: 'jwt' })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  it('reports a broker URL that is no URL like any other invalid variable', () => {
+    // The refinements run after the URL check failed: they must not throw,
+    // the report lists every invalid variable.
+    for (const url of [
+      'localhost',
+      'broker.example.org',
+      'mqtt://host:65536',
+      'mqtt://exa mple.org',
+      'mqtt://[::1',
+    ]) {
+      expect(
+        () => configSchema.safeParse({ TELEMETRY_MQTT_URL: url }),
+        url,
+      ).not.toThrow();
+      expect(problems(url), url).toEqual([
+        expect.stringMatching(/^PORT: /),
+        'TELEMETRY_MQTT_URL: Invalid URL',
+      ]);
+    }
+  });
+
+  it('refuses broker URLs devices cannot connect to: port 0, a host that is not ASCII', () => {
+    expect(problems('mqtt://host:0')).toEqual([
+      expect.stringMatching(/^PORT: /),
+      expect.stringMatching(/^TELEMETRY_MQTT_URL: .*port 1–65535/),
+    ]);
+    // mqtt: is no special scheme of the URL standard: a non-ASCII host is
+    // percent-encoded (b%C3%BCcher.example), never converted to punycode.
+    for (const url of [
+      'mqtt://bücher.example:1883',
+      'mqtts://b%C3%BCcher.example',
+    ]) {
+      expect(problems(url), url).toEqual([
+        expect.stringMatching(/^PORT: /),
+        expect.stringMatching(/^TELEMETRY_MQTT_URL: .*punycode/),
+      ]);
+    }
+    // Its punycode form, IP addresses and names with `_` (compose services) are fine.
+    for (const url of [
+      'mqtt://xn--bcher-kva.example:1883',
+      'mqtt://10.0.0.5:1883',
+      'mqtt://[2001:db8::1]:8883',
+      'mqtt://nats_mqtt:1883',
+      'mqtts://mqtt.example.org:65535',
+    ]) {
+      expect(load({ TELEMETRY_MQTT_URL: url }).TELEMETRY_MQTT_URL, url).toBe(
+        url,
+      );
+    }
   });
 
   it('refuses invalid values', () => {

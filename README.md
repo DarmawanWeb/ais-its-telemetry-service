@@ -26,7 +26,10 @@ The service **owns**:
   `fuel.reading.v1.<mmsi>` (stream `FUEL`, created/widened at boot as its producer): published after
   the commit with `Nats-Msg-Id = <mmsi>:<time>`, and republished by a relay when that failed.
 - **Device registry** — fuel meters and gateways of an organization, each installed on one vessel;
-  `mqtt` devices publish to their own MQTT topic, `http` devices post with their own API key.
+  `mqtt` devices publish to their own MQTT topic, `http` devices post with their own API key. Each
+  device carries its vessel's name, the measurement time of its newest reading and its connection
+  state (`online` / `idle` / `offline` / `never` / `inactive`); `mqtt` devices get their connection
+  details (broker URL, port, TLS, MQTT version, topic, QoS, broker user) from the configuration.
 - **Telemetry status** — whether a vessel's telemetry is "active" (newest reading within
   `TELEMETRY_ACTIVE_WINDOW_MIN`, default 10 min; the emission service prefers telemetry fuel while it
   is active).
@@ -35,7 +38,8 @@ The service **owns**:
 
 It does **not**: compute fuel from AIS (emission does), store vessel master data (fleet), manage API
 keys (auth issues them; this service introspects them through the kit), or run the MQTT broker (the
-NATS server's MQTT gateway does, spec §3).
+NATS server's MQTT gateway does, spec §3) — nor issue, store or verify MQTT credentials: the broker
+authenticates devices (see _MQTT connection of a device_).
 
 ## Architecture
 
@@ -120,7 +124,7 @@ tick, NATS drains and the pool closes.
 | `src/config.ts`                        | zod environment schema (kit base + `TELEMETRY_*`)                                                             |
 | `src/domain/`                          | pure rules: reading plausibility and dedup, bucket/summary planning and totals, the "active" rule (`@method`) |
 | `src/modules/readings/`                | REST ingest, queries and the CSV export, the shared ingestion pipeline, MQTT parsing, publisher, relay        |
-| `src/modules/devices/`                 | device registry (controller → service → repository, DTOs) and the read-only devices of a vessel               |
+| `src/modules/devices/`                 | device registry (controller → service → repository, DTOs), connection state, MQTT connection, vessel devices  |
 | `src/modules/vessels/`                 | FLEET projection repository and the tenancy rules built on it                                                 |
 | `src/modules/methodology/`             | `GET /api/v2/telemetry/methodology` (spec §17)                                                                |
 | `src/consumers/`                       | `telemetry-fleet` durable consumer, `telemetry-mqtt` core subscription                                        |
@@ -132,14 +136,14 @@ tick, NATS drains and the pool closes.
 Schema `telemetry`, owned by `telemetry_svc`; migrations in [`migrations/`](migrations) are
 forward-only and checksummed (never edit an applied file — add `NNNN_<change>.sql`).
 
-| Table / view                                         | Columns (essentials)                                                                                                                                                      | Notes                                                                                                                                                                                                                                                                                                                                                                      |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fuel_readings` (hypertable on `time`, 7-day chunks) | `time`, `mmsi`, `device_id`, `period_start`, `fuel_me_ton`, `fuel_ae_ton` (≥ 0, t), `source` (`device`\|`mqtt`\|`api`\|`manual`\|`import`), `received_at`, `published_at` | PK `(mmsi, time)`: one immutable reading per vessel and instant (exact repeats are duplicates, different readings conflicts — never overwritten). `time` is the end of the measured period (since `period_start` when given). Compressed after 7 days (`segmentby mmsi`, `orderby time DESC`), retention 5 years. `published_at` is `NULL` until the reading is in `FUEL`. |
-| `fuel_readings_unpublished`                          | `mmsi`, `time`, `received_at`                                                                                                                                             | Work queue of the relay: one row per reading with `published_at IS NULL`, written and removed in the same transactions as the reading / its `published_at`, locked with `FOR UPDATE SKIP LOCKED` (replicas share the backlog).                                                                                                                                             |
-| `fuel_hourly` (continuous aggregate)                 | `bucket` (UTC hour), `mmsi`, `fuel_me_ton`, `fuel_ae_ton`, `readings`, `first_time`, `last_time`                                                                          | Real-time aggregation; refresh policy every 15 min up to `now − 1 h`, refresh window without a start (invalidation-driven, so late readings and imports of any age are folded in; each UTC day of a request is its own transaction, so only those days are re-aggregated). Retention 5 years.                                                                              |
-| `fuel_daily` (hierarchical, on `fuel_hourly`)        | same columns per UTC day                                                                                                                                                  | Real-time; refresh policy hourly up to `now − 1 day`, window without a start. Kept indefinitely.                                                                                                                                                                                                                                                                           |
-| `vessels` (FLEET projection)                         | `mmsi` PK, `vessel_id` unique, `org_id`, `name`, `status`, `source_updated_at`, `deleted_at`                                                                              | Snapshots apply only when newer (`updatedAt`); deletions leave a tombstone so late, older snapshots stay ignored; an MMSI change moves the row.                                                                                                                                                                                                                            |
-| `devices`                                            | `id`, `org_id`, `mmsi`, `name`, `kind` (`mqtt`\|`http`), `api_key_id`, `status` (`active`\|`inactive`), `serial_number`, `last_seen_at`, `created_by`                     | `org_id` is the organization of the vessel at registration. `http` devices need `api_key_id`, `mqtt` devices have none (`CHECK`). Unique `(org_id, name)` and `(org_id, api_key_id)`. `last_seen_at` is updated at most once a minute. A vessel may have several devices, but one reading per instant (see the ingestion rules).                                           |
+| Table / view                                         | Columns (essentials)                                                                                                                                                      | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fuel_readings` (hypertable on `time`, 7-day chunks) | `time`, `mmsi`, `device_id`, `period_start`, `fuel_me_ton`, `fuel_ae_ton` (≥ 0, t), `source` (`device`\|`mqtt`\|`api`\|`manual`\|`import`), `received_at`, `published_at` | PK `(mmsi, time)`: one immutable reading per vessel and instant (exact repeats are duplicates, different readings conflicts — never overwritten). `time` is the end of the measured period (since `period_start` when given). Compressed after 7 days (`segmentby mmsi`, `orderby time DESC`), retention 5 years. `published_at` is `NULL` until the reading is in `FUEL`.                                                                                                                                                                               |
+| `fuel_readings_unpublished`                          | `mmsi`, `time`, `received_at`                                                                                                                                             | Work queue of the relay: one row per reading with `published_at IS NULL`, written and removed in the same transactions as the reading / its `published_at`, locked with `FOR UPDATE SKIP LOCKED` (replicas share the backlog).                                                                                                                                                                                                                                                                                                                           |
+| `fuel_hourly` (continuous aggregate)                 | `bucket` (UTC hour), `mmsi`, `fuel_me_ton`, `fuel_ae_ton`, `readings`, `first_time`, `last_time`                                                                          | Real-time aggregation; refresh policy every 15 min up to `now − 1 h`, refresh window without a start (invalidation-driven, so late readings and imports of any age are folded in; each UTC day of a request is its own transaction, so only those days are re-aggregated). Retention 5 years.                                                                                                                                                                                                                                                            |
+| `fuel_daily` (hierarchical, on `fuel_hourly`)        | same columns per UTC day                                                                                                                                                  | Real-time; refresh policy hourly up to `now − 1 day`, window without a start. Kept indefinitely.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `vessels` (FLEET projection)                         | `mmsi` PK, `vessel_id` unique, `org_id`, `name`, `status`, `source_updated_at`, `deleted_at`                                                                              | Snapshots apply only when newer (`updatedAt`); deletions leave a tombstone so late, older snapshots stay ignored; an MMSI change moves the row.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `devices`                                            | `id`, `org_id`, `mmsi`, `name`, `kind` (`mqtt`\|`http`), `api_key_id`, `status` (`active`\|`inactive`), `serial_number`, `last_seen_at`, `last_reading_at`, `created_by`  | `org_id` is the organization of the vessel at registration. `http` devices need `api_key_id`, `mqtt` devices have none (`CHECK`). Unique `(org_id, name)` and `(org_id, api_key_id)`. `last_seen_at` (receipt) and `last_reading_at` (measurement time of the newest reading stored as the device's on its current vessel, `0003`; cleared by a move to another vessel) are written together when one of them advances by more than a minute, never backwards. A vessel may have several devices, but one reading per instant (see the ingestion rules). |
 
 Bucketed queries read the continuous aggregates; summaries combine whole UTC days from
 `fuel_daily`, whole hours from `fuel_hourly` and the unaligned edges from `fuel_readings`, so the
@@ -164,9 +168,10 @@ Routes live under `/api/v2` (OpenAPI UI `/docs`, JSON `/openapi.json`, committed
 | GET    | `/telemetry/vessels/:mmsi/summary?from&to`                                                  | `telemetry:read`                                | Totals over `[from, to)` (default 30 days): `readings`, `fuelMeTon`, `fuelAeTon`, `totalFuelTon`, `firstReadingAt`, `lastReadingAt`.                                                                                                               |
 | GET    | `/telemetry/vessels/:mmsi/status`                                                           | `telemetry:read`                                | `{ mmsi, active, lastReadingAt, activeWindowMin, lastReading }`.                                                                                                                                                                                   |
 | POST   | `/telemetry/devices`                                                                        | `device:manage`                                 | Register a device on a vessel of the organization (`201`); `mqttTopic` in the response for `mqtt` devices.                                                                                                                                         |
-| GET    | `/telemetry/devices?mmsi&kind&status&search&orgId&page&pageSize`                            | `device:manage`                                 | Devices of the organization (platform administrators: all, or `orgId`).                                                                                                                                                                            |
+| GET    | `/telemetry/devices?mmsi&kind&status&search&orgId&page&pageSize`                            | `device:manage`                                 | Devices of the organization (platform administrators: all, or `orgId`), each with `vesselName`, `lastSeenAt`, `lastReadingAt` and `connectionState` (+ `activeWindowMin`, `offlineAfterMin`), see _Device connection state_.                       |
 | GET    | `/telemetry/devices/:id`                                                                    | `device:manage`                                 | One device (`404` for devices of other organizations).                                                                                                                                                                                             |
-| PATCH  | `/telemetry/devices/:id`                                                                    | `device:manage`                                 | Rename, (de)activate, move to another vessel of the same organization, change kind / API key; `null` clears `apiKeyId` / `serialNumber`.                                                                                                           |
+| GET    | `/telemetry/devices/:id/connection`                                                         | `device:manage`                                 | MQTT connection of an `mqtt` device: `{ deviceId, brokerUrl, host, port, tls, protocolVersion, topic, qos, authentication, username }`, no secret; `409 DEVICE_NOT_MQTT` for `http` devices. See _MQTT connection of a device_.                    |
+| PATCH  | `/telemetry/devices/:id`                                                                    | `device:manage`                                 | Rename, (de)activate, move to another vessel of the same organization (clears `lastReadingAt`), change kind / API key; `null` clears `apiKeyId` / `serialNumber`.                                                                                  |
 | DELETE | `/telemetry/devices/:id`                                                                    | `device:manage`                                 | `204`; the device's readings are kept (with their `deviceId`).                                                                                                                                                                                     |
 | GET    | `/telemetry/methodology`                                                                    | any signed-in user                              | Methods implemented here, resolved against the catalog (spec §17).                                                                                                                                                                                 |
 
@@ -203,6 +208,77 @@ without the registry permission: `id` (the `deviceId` of its raw readings), `nam
 and `lastSeenAt`; never the API key, serial number, MQTT topic or creator, which stay
 `device:manage`. They are the devices of the vessel's current organization, the ones the vessel
 overview counts; page-based like the registry (`page`, `pageSize` ≤ 100).
+
+**Device connection state.** Every device of the registry (`GET /telemetry/devices`, `GET …/:id`,
+and the `POST`/`PATCH` responses) carries `vesselName` (the FLEET projection's name of its vessel,
+joined by primary key; `null` while the MMSI is not a live vessel), `lastSeenAt` (when it last
+delivered readings, receipt time), `lastReadingAt` (the measurement time `time` of the newest
+reading stored as the device's on its current vessel — a new reading or an exact repeat; readings
+refused as conflicts do not count) and `connectionState`, computed when the response is built:
+
+| `connectionState` | When                                                                                                                                                              |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inactive`        | the device is switched off (`status = inactive`, its readings are refused), whatever it delivered before                                                          |
+| `never`           | no reading stored as the device's on its current vessel yet (`lastReadingAt = null`; `lastSeenAt` may be set, see _Troubleshooting_)                              |
+| `online`          | `now − lastReadingAt ≤ activeWindowMin` (`TELEMETRY_ACTIVE_WINDOW_MIN`): the vessel telemetry "active" rule (`isTelemetryActive`, method `fuel.method_selection`) |
+| `idle`            | older than that, `≤ offlineAfterMin` (`TELEMETRY_DEVICE_OFFLINE_AFTER_MIN`, default 1440 = 24 h)                                                                  |
+| `offline`         | older than `offlineAfterMin`                                                                                                                                      |
+
+The thresholds are in every item (`activeWindowMin`, `offlineAfterMin`), so clients render the same
+boundaries the server applies. The age is the measurement time, like the vessel status: an online
+device keeps its vessel's telemetry active, and a device forwarding old readings (or with its clock
+behind) is `idle`/`offline` although `lastSeenAt` is recent. `lastReadingAt` counts the readings on
+the device's current vessel only: moving the device to another vessel (`PATCH` `mmsi`) clears it in
+the same statement, so the device is `never` until its first reading there (also when moved back to
+a vessel it reported on before), and a batch of its previous vessel still in flight refreshes
+`lastSeenAt` only; `lastSeenAt` is kept across a move. Both timestamps have minute resolution: they
+are written together when one of them advances by more than a minute (a device reporting in real
+time: about once a minute; one catching up on stored readings: as its newest reading advances),
+never backwards, so `lastReadingAt` may trail the newest reading by up to a minute plus the
+reporting interval. Migration `0003` backfilled `last_reading_at` from each device's stored readings
+on its current vessel: a device that has not reported since it was moved (before `0003`) is `never`
+until its next reading.
+
+**MQTT connection of a device.** `GET /telemetry/devices/:id/connection` (`device:manage`, the
+device's organization; platform administrators: any) tells an installer how an `mqtt` device reaches
+the platform's broker, the NATS MQTT gateway:
+
+```json
+{
+  "deviceId": "0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77",
+  "brokerUrl": "mqtts://mqtt.example.org:8883",
+  "host": "mqtt.example.org",
+  "port": 8883,
+  "tls": true,
+  "protocolVersion": "3.1.1",
+  "topic": "aisits/telemetry/0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77",
+  "qos": 1,
+  "authentication": "password",
+  "username": "0193a0f2-6c1e-7a52-9d4b-3c8f0e2a1b77"
+}
+```
+
+`brokerUrl`, `host`, `port` and `tls` come from `TELEMETRY_MQTT_URL` (`mqtt://` plain, default port
+1883; `mqtts://` TLS, default port 8883) — the address devices reach, not `NATS_URL`; the service
+never connects to it. `protocolVersion` is `3.1.1` (the gateway does not speak MQTT 5), `qos` is 1
+(a QoS 0 message published right before a disconnect can be lost; repeats are stored once).
+`authentication` (`TELEMETRY_MQTT_AUTH`) says how the broker authenticates devices: `none` — any
+client may connect (the development broker of `infra/compose`), `username` is `null`; `password` —
+one broker user per device, named by the device id and allowed to publish to its own subject only
+(`infra/nats/nats.conf`, production section), `username` is the device id. `http` devices answer
+`409 DEVICE_NOT_MQTT`: they post to `POST /api/v2/telemetry/readings` with their API key.
+
+**No credentials are issued here.** The response never carries a password, and this service does
+not issue per-device MQTT credentials: the broker authenticates MQTT clients against its own users
+(server configuration or operator JWTs), not against this service, so a password generated here
+would not be checked (the development broker accepts any client) and would only look like
+protection. Making this service the authenticator (a NATS auth callout) would put it in the broker's
+connect path with the account's signing key — in configuration mode for every NATS connection that
+is not exempted — which is a platform decision (spec §3, §7.3, `infra/nats`, Helm), and machine
+credentials are the auth service's domain (spec §8.1, §13.1: API keys, hashed, shown once,
+revocable, audited). The platform operator provisions each device's broker user and password and
+hands the password to the installer; deactivating a device refuses its messages at once
+(`inactive_device`), removing its broker user revokes its access to the broker.
 
 **Ingestion rules.** Readings are validated before anything is stored: `fuelMeTon`/`fuelAeTon`
 finite, `≥ 0` and `≤ TELEMETRY_MAX_FUEL_ME_TON` / `TELEMETRY_MAX_FUEL_AE_TON`; `time` ISO-8601 UTC,
@@ -265,6 +341,7 @@ readings cost their own days only.
 | `DEVICE_NAME_TAKEN`           | 409    | the organization has a device of that name                                                                                                                                                                                                             |
 | `DEVICE_API_KEY_TAKEN`        | 409    | the API key is linked to another device of the organization                                                                                                                                                                                            |
 | `DEVICE_CREDENTIAL_CONFLICT`  | 409    | a concurrent change left kind and API key of a device inconsistent (reload, retry)                                                                                                                                                                     |
+| `DEVICE_NOT_MQTT`             | 409    | MQTT connection details of an `http` device (it posts with its API key)                                                                                                                                                                                |
 | `READING_CONFLICT`            | 409    | a vessel has a different reading at one of the times already (`errors[]`: `<index>.time`)                                                                                                                                                              |
 | `VESSEL_WITHOUT_ORGANIZATION` | 422    | a device for a vessel that belongs to no organization                                                                                                                                                                                                  |
 
@@ -294,35 +371,38 @@ three times (core NATS has no redelivery).
 Every variable is listed with its development default in [`.env.example`](.env.example); the
 service refuses to start on invalid values and prints every problem (spec §4).
 
-| Variable                                                  | Default                                                                      | Notes                                                                                                                                                           |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                                                | `development`                                                                | `development` \| `test` \| `production` (production refuses the development secrets)                                                                            |
-| `SERVICE_NAME` / `SERVICE_VERSION`                        | `telemetry` / `package.json` version                                         | logs, metrics, event `source`, `audit.v1.<name>`, core subscription queue group                                                                                 |
-| `HOST` / `PORT`                                           | `0.0.0.0` / `3005`                                                           | spec §3                                                                                                                                                         |
-| `LOG_LEVEL` / `LOG_PRETTY`                                | `info` / `true` in development                                               | pino                                                                                                                                                            |
-| `DATABASE_URL`                                            | `postgres://telemetry_svc:telemetry_svc@localhost:5432/aisits`               | required in production                                                                                                                                          |
-| `DATABASE_SCHEMA`                                         | `telemetry`                                                                  | `search_path=telemetry,public`                                                                                                                                  |
-| `DATABASE_POOL_MAX` / `DATABASE_STATEMENT_TIMEOUT_MS`     | `10` / `30000`                                                               |                                                                                                                                                                 |
-| `DB_MIGRATE_ON_BOOT`                                      | `true`                                                                       | also `pnpm migrate`                                                                                                                                             |
-| `NATS_URL`                                                | `nats://localhost:4222`                                                      | comma separated list allowed; the MQTT gateway runs on the same server; its `max_payload` should be ≥ 4MB (warning at connect otherwise)                        |
-| `NATS_DURABLE_PREFIX`                                     | empty                                                                        | test suites only                                                                                                                                                |
-| `REDIS_URL`                                               | `redis://localhost:6379`                                                     | base schema; not used by this service                                                                                                                           |
-| `AUTH_JWKS_URL`, `AUTH_ISSUER`, `AUTH_AUDIENCE`           | `http://localhost:3001/.well-known/jwks.json`, `ais-its-auth`, `ais-its-api` | access tokens are verified locally                                                                                                                              |
-| `AUTH_INTERNAL_URL`                                       | `http://localhost:3001`                                                      | API-key introspection (cached 60 s)                                                                                                                             |
-| `INTERNAL_TOKEN`                                          | `dev-internal-token-change-me`                                               | ≥ 16 characters and not the default in production                                                                                                               |
-| `CORS_ORIGINS`, `PUBLIC_BASE_URL`                         | see `.env.example`                                                           | CORS exposes `X-Request-Id`, `Retry-After`, `WWW-Authenticate`, `ETag`, `Location` and `Content-Disposition` (CSV file name)                                    |
-| `TRUSTED_PROXIES`                                         | `loopback,linklocal,uniquelocal`                                             | proxies whose `X-Forwarded-For` is trusted; **production: the gateway's address or CIDR only** (a warning is logged at boot while the default is in effect)     |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER*`     | unset                                                                        | tracing (OTLP/HTTP traces only) when set                                                                                                                        |
-| `SHUTDOWN_TIMEOUT_MS`                                     | `30000`                                                                      | graceful shutdown deadline                                                                                                                                      |
-| `TELEMETRY_ACTIVE_WINDOW_MIN`                             | `10` (1–1440)                                                                | "active" window W, minutes (`fuel.method_selection`)                                                                                                            |
-| `TELEMETRY_MAX_FUTURE_SKEW_MIN`                           | `5` (0–60)                                                                   | accepted clock skew of `time`, minutes                                                                                                                          |
-| `TELEMETRY_MAX_AGE_DAYS`                                  | `1825` (1–1825)                                                              | oldest accepted `time` (the 5-year retention)                                                                                                                   |
-| `TELEMETRY_MAX_FUEL_ME_TON` / `TELEMETRY_MAX_FUEL_AE_TON` | `500` / `100` (> 0)                                                          | largest fuel of one reading, t (v2 design defaults)                                                                                                             |
-| `TELEMETRY_MAX_PERIOD_H`                                  | `24` (1–744)                                                                 | longest `time − periodStart`, hours                                                                                                                             |
-| `TELEMETRY_PUBLISH_TIMEOUT_MS`                            | `5000`                                                                       | JetStream ack timeout per publish; while NATS stalls a request waits at most this long after the commit (readings and audit records are published concurrently) |
-| `TELEMETRY_RELAY_INTERVAL_MS`                             | `5000` (`0` disables)                                                        | relay poll interval                                                                                                                                             |
-| `TELEMETRY_RELAY_AFTER_S`                                 | `30`                                                                         | grace period before the relay republishes an unpublished reading                                                                                                |
-| `TELEMETRY_RELAY_BATCH_SIZE`                              | `500`                                                                        | readings per relay transaction (at most 20 transactions per tick)                                                                                               |
+| Variable                                                  | Default                                                                      | Notes                                                                                                                                                                                                                                |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NODE_ENV`                                                | `development`                                                                | `development` \| `test` \| `production` (production refuses the development secrets)                                                                                                                                                 |
+| `SERVICE_NAME` / `SERVICE_VERSION`                        | `telemetry` / `package.json` version                                         | logs, metrics, event `source`, `audit.v1.<name>`, core subscription queue group                                                                                                                                                      |
+| `HOST` / `PORT`                                           | `0.0.0.0` / `3005`                                                           | spec §3                                                                                                                                                                                                                              |
+| `LOG_LEVEL` / `LOG_PRETTY`                                | `info` / `true` in development                                               | pino                                                                                                                                                                                                                                 |
+| `DATABASE_URL`                                            | `postgres://telemetry_svc:telemetry_svc@localhost:5432/aisits`               | required in production                                                                                                                                                                                                               |
+| `DATABASE_SCHEMA`                                         | `telemetry`                                                                  | `search_path=telemetry,public`                                                                                                                                                                                                       |
+| `DATABASE_POOL_MAX` / `DATABASE_STATEMENT_TIMEOUT_MS`     | `10` / `30000`                                                               |                                                                                                                                                                                                                                      |
+| `DB_MIGRATE_ON_BOOT`                                      | `true`                                                                       | also `pnpm migrate`                                                                                                                                                                                                                  |
+| `NATS_URL`                                                | `nats://localhost:4222`                                                      | comma separated list allowed; the MQTT gateway runs on the same server; its `max_payload` should be ≥ 4MB (warning at connect otherwise)                                                                                             |
+| `NATS_DURABLE_PREFIX`                                     | empty                                                                        | test suites only                                                                                                                                                                                                                     |
+| `REDIS_URL`                                               | `redis://localhost:6379`                                                     | base schema; not used by this service                                                                                                                                                                                                |
+| `AUTH_JWKS_URL`, `AUTH_ISSUER`, `AUTH_AUDIENCE`           | `http://localhost:3001/.well-known/jwks.json`, `ais-its-auth`, `ais-its-api` | access tokens are verified locally                                                                                                                                                                                                   |
+| `AUTH_INTERNAL_URL`                                       | `http://localhost:3001`                                                      | API-key introspection (cached 60 s)                                                                                                                                                                                                  |
+| `INTERNAL_TOKEN`                                          | `dev-internal-token-change-me`                                               | ≥ 16 characters and not the default in production                                                                                                                                                                                    |
+| `CORS_ORIGINS`, `PUBLIC_BASE_URL`                         | see `.env.example`                                                           | CORS exposes `X-Request-Id`, `Retry-After`, `WWW-Authenticate`, `ETag`, `Location` and `Content-Disposition` (CSV file name)                                                                                                         |
+| `TRUSTED_PROXIES`                                         | `loopback,linklocal,uniquelocal`                                             | proxies whose `X-Forwarded-For` is trusted; **production: the gateway's address or CIDR only** (a warning is logged at boot while the default is in effect)                                                                          |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER*`     | unset                                                                        | tracing (OTLP/HTTP traces only) when set                                                                                                                                                                                             |
+| `SHUTDOWN_TIMEOUT_MS`                                     | `30000`                                                                      | graceful shutdown deadline                                                                                                                                                                                                           |
+| `TELEMETRY_ACTIVE_WINDOW_MIN`                             | `10` (1–1440)                                                                | "active" window W, minutes (`fuel.method_selection`); also the `online` limit of a device's `connectionState`                                                                                                                        |
+| `TELEMETRY_DEVICE_OFFLINE_AFTER_MIN`                      | `1440` (1–525600, ≥ `TELEMETRY_ACTIVE_WINDOW_MIN`)                           | a device whose newest reading is older is `offline` (`idle` in between); v2 design default (24 h)                                                                                                                                    |
+| `TELEMETRY_MQTT_URL`                                      | `mqtt://localhost:1883`                                                      | the broker as devices reach it (`mqtt://host[:port]` or `mqtts://host[:port]`, no credentials or path; an ASCII host: internationalized names in punycode, `xn--…`); **production: the public endpoint** (warning at boot otherwise) |
+| `TELEMETRY_MQTT_AUTH`                                     | `password` in production, `none` otherwise                                   | how the broker authenticates devices: `none` (any client) or `password` (a broker user per device, named by its id, provisioned by the platform operator)                                                                            |
+| `TELEMETRY_MAX_FUTURE_SKEW_MIN`                           | `5` (0–60)                                                                   | accepted clock skew of `time`, minutes                                                                                                                                                                                               |
+| `TELEMETRY_MAX_AGE_DAYS`                                  | `1825` (1–1825)                                                              | oldest accepted `time` (the 5-year retention)                                                                                                                                                                                        |
+| `TELEMETRY_MAX_FUEL_ME_TON` / `TELEMETRY_MAX_FUEL_AE_TON` | `500` / `100` (> 0)                                                          | largest fuel of one reading, t (v2 design defaults)                                                                                                                                                                                  |
+| `TELEMETRY_MAX_PERIOD_H`                                  | `24` (1–744)                                                                 | longest `time − periodStart`, hours                                                                                                                                                                                                  |
+| `TELEMETRY_PUBLISH_TIMEOUT_MS`                            | `5000`                                                                       | JetStream ack timeout per publish; while NATS stalls a request waits at most this long after the commit (readings and audit records are published concurrently)                                                                      |
+| `TELEMETRY_RELAY_INTERVAL_MS`                             | `5000` (`0` disables)                                                        | relay poll interval                                                                                                                                                                                                                  |
+| `TELEMETRY_RELAY_AFTER_S`                                 | `30`                                                                         | grace period before the relay republishes an unpublished reading                                                                                                                                                                     |
+| `TELEMETRY_RELAY_BATCH_SIZE`                              | `500`                                                                        | readings per relay transaction (at most 20 transactions per tick)                                                                                                                                                                    |
 
 ## Local development
 
@@ -353,9 +433,11 @@ curl -s -X POST localhost:3005/api/v2/telemetry/readings -H "x-api-key: $TELEMET
 curl -s "localhost:3005/api/v2/telemetry/vessels/525005223/readings?bucket=1h" -H "authorization: Bearer $TOKEN"
 curl -s "localhost:3005/api/v2/telemetry/vessels/525005223/readings?order=desc&limit=20" -H "authorization: Bearer $TOKEN"
 curl -sOJ "localhost:3005/api/v2/telemetry/vessels/525005223/readings.csv?bucket=1h" -H "authorization: Bearer $TOKEN"
-# a registered mqtt device (POST /api/v2/telemetry/devices) publishing like a fuel meter:
-mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
+# a registered mqtt device (POST /api/v2/telemetry/devices): its connection, then publishing like a fuel meter:
+curl -s "localhost:3005/api/v2/telemetry/devices/$DEVICE_ID/connection" -H "authorization: Bearer $TOKEN"
+mosquitto_pub -V mqttv311 -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
   -m '{"time":"2026-11-21T10:05:00Z","fuelMeTon":0.04,"fuelAeTon":0.01}'
+curl -s "localhost:3005/api/v2/telemetry/devices?mmsi=525005223" -H "authorization: Bearer $TOKEN"  # connectionState
 ```
 
 | Script                                          | What                                                                    |
@@ -375,8 +457,11 @@ mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
   (`domain/fuel-reading`), bucket alignment, summary planning and totals (`domain/fuel-aggregation`),
   the "active" rule incl. the legacy `/10 000` bug as a regression case (`domain/telemetry-status`),
   MQTT payload/subject parsing, the body pipe, publisher/relay failure handling, the services' tenancy
-  and attribution rules, series order and cursors, the CSV formatting and the batching of the export
-  (incl. a sanitized failure after the first batch), configuration, and the handbook's rollout and
+  and attribution rules, the newest stored reading of a batch (`latest`: duplicates count, conflicts
+  do not), a device's connection state at every boundary (`modules/devices/device`), the broker
+  URL and connection details (`modules/devices/device-connection`), series order and cursors, the
+  CSV formatting and the batching of the export (incl. a sanitized failure after the first batch),
+  configuration (incl. the offline threshold and broker URL rules), and the handbook's rollout and
   troubleshooting notes and the 0.2.0 changelog entry they rely on (`src/docs.spec.ts`).
 - **Integration** (`pnpm test:int`, Docker; containers `timescale/timescaledb-ha:pg17` and
   `nats:2.11-alpine` — JetStream, the MQTT gateway and `max_payload` 4MB like the platform's
@@ -401,18 +486,29 @@ mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
     `docker pause`: a user's request for three vessels answers within `TELEMETRY_PUBLISH_TIMEOUT_MS`
     (audit records included) and leaves the readings queued;
   - `device-messages` — the MQTT path on the core subject: accepted readings (stored, published,
-    `lastSeenAt`), store-and-forward arrays, duplicates, a second meter of the vessel reporting the
-    same instant (`conflict`, the rest of its message stored), and every rejection outcome counted;
+    `lastSeenAt`, `lastReadingAt`, `online`), store-and-forward arrays (older readings never move
+    `lastReadingAt` back), duplicates, a second meter of the vessel reporting the same instant
+    (`conflict`: no `lastReadingAt` from refused readings, the rest of its message stored), and
+    every rejection outcome counted;
   - `mqtt-gateway` — a real MQTT client (QoS 1) against the MQTT gateway of the shared test NATS
-    (`testInfra('nats').nats.mqttUrl`);
+    (`testInfra('nats').nats.mqttUrl`), and one that connects with exactly the details of
+    `GET /telemetry/devices/:id/connection` (host, port, MQTT 3.1.1, topic, QoS) and turns the
+    device `online`;
   - `devices` — registry CRUD, validation (incl. `null` for non-nullable fields), unique
-    names/keys, tenancy, permissions, audit events, the read-only devices of a vessel;
+    names/keys, tenancy, permissions, audit events, the read-only devices of a vessel, vessel names
+    (moved device, deleted vessel), `lastReadingAt` and every `connectionState`, a reporting device
+    moved to another vessel (`never` there until its first reading, a batch of its previous vessel
+    in flight refreshes only `lastSeenAt`), the connection endpoint (`409` for `http` devices,
+    `404` across organizations, `403` without `device:manage`);
   - `fleet-projection` — ownership changes, out-of-order snapshots, deletions and MMSI changes;
   - `aggregates` — historical imports folded in by the real refresh-policy jobs, one invalidation
     range per UTC day of a request (read from the TimescaleDB catalog), duplicates, conflicts and
-    inserts in compressed chunks;
-  - `app` — health, migrations/policies, a retried migration `0002` that failed halfway,
-    problem details, the catalogued methodology, OpenAPI, metrics.
+    inserts in compressed chunks, and the tests' manual refresh (`test/support/aggregates.ts`:
+    policies paused, a run in progress waited out instead of failing with `55P03`);
+  - `app` — health, migrations/policies, a retried migration `0002` that failed halfway, the
+    `0003` backfill of `last_reading_at` (a device behind newer readings of another one on its
+    vessel, a silent and a moved device) retried without overwriting values, problem details, the
+    catalogued methodology, OpenAPI, metrics.
 - `TEST_LOG_LEVEL=debug pnpm test:int` shows the service logs (silent by default).
   `TESTCONTAINERS_RYUK_DISABLED=true` is set by the configuration; the global teardown stops the
   containers.
@@ -433,14 +529,19 @@ mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
 
 - **Replicas**: any number, rolling updates included: the relay shares the backlog
   (`FOR UPDATE SKIP LOCKED`), the MQTT subscription is a queue group, `telemetry-fleet` is a shared
-  durable with an idempotent, versioned projection. **Rolling update from 0.1.0**: no migration, and
+  durable with an idempotent, versioned projection. **Rolling update from 0.1.0**: the first 0.2.0
+  replica applies migration `0003` (adds the nullable `devices.last_reading_at` and backfills it;
+  row locks only), which 0.1.0 replicas tolerate (they log that a recorded migration has no file);
   both versions share the tables, subjects, queue group and durable, so ingest, MQTT, the relay and
   the projection run on mixed replicas, and ascending series pages without `order` continue across
-  them (each version reads the other's ascending cursors). Only 0.2.0 replicas answer the new API:
-  a 0.1.0 replica answers every request with `order`, `order=asc` included, with
-  `400 VALIDATION_FAILED` (`{ field: 'order', code: 'whitelistValidation' }`), and `…/readings.csv`
-  and `/telemetry/vessels/:mmsi/devices` with `404 NOT_FOUND`. Switch the web app to `order=desc`,
-  the CSV export and the devices list only once every telemetry replica runs 0.2.0.
+  them (each version reads the other's ascending cursors). Readings a 0.1.0 replica stores do not
+  advance `lastReadingAt` (the device's next reading on a 0.2.0 replica does). Only 0.2.0 replicas
+  answer the new API: a 0.1.0 replica answers every request with `order`, `order=asc` included, with
+  `400 VALIDATION_FAILED` (`{ field: 'order', code: 'whitelistValidation' }`), `…/readings.csv`,
+  `/telemetry/vessels/:mmsi/devices` and `/telemetry/devices/:id/connection` with `404 NOT_FOUND`,
+  and devices without `vesselName`, `lastReadingAt` and `connectionState`. Switch the web app to
+  `order=desc`, the CSV export, the devices list, the device connection state and the connection
+  guide only once every telemetry replica runs 0.2.0.
 - **Health**: `/health/live` (process), `/health/ready` (database, NATS; `503` while draining or when
   the FLEET consumer stalls).
 - **Metrics** (`/metrics`, prefix `aisits_`): kit HTTP RED metrics, event metrics
@@ -466,7 +567,9 @@ mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
     While NATS stalls, ingest requests wait at most `TELEMETRY_PUBLISH_TIMEOUT_MS` after the commit
     (users' audit records included; the log `Audit records of the readings still pending` tells).
   - _Startup warnings_: `max_payload` below 4 MiB (set `max_payload: 4MB` on the NATS server) and, in
-    production, the default `TRUSTED_PROXIES` (set it to the gateway's address or CIDR).
+    production, the default `TRUSTED_PROXIES` (set it to the gateway's address or CIDR) and the
+    development `TELEMETRY_MQTT_URL` (set the broker URL devices reach, e.g.
+    `mqtts://mqtt.example.org:8883`).
   - _A CSV download ends with a network error_: the database failed after the first bytes (log
     `Fuel series export failed while streaming`); retry, or narrow the range.
   - _`409 READING_CONFLICT` / outcome `conflict` /
@@ -482,6 +585,15 @@ mosquitto_pub -h localhost -p 1883 -q 1 -t "aisits/telemetry/$DEVICE_ID" \
     (`unknown_device`: wrong topic or unregistered device; `inactive_device`; `transport_mismatch`: an
     `http` device publishing over MQTT; `vessel_mismatch`: the vessel changed organization —
     re-register the device). The topic must be `aisits/telemetry/<deviceId>` exactly.
+  - _A device stays `never` or turns `idle` while it delivers_ (`lastSeenAt` is recent): the state
+    follows the measurement time of its readings stored on its current vessel. `never` with a
+    `lastSeenAt`: everything it sent conflicted with readings of another producer (see
+    `409 READING_CONFLICT` above); it was moved to another vessel since its last reading and has not
+    reported there yet (also a move before migration `0003`, which backfilled from the current
+    vessel only); or its readings since `0003` were all stored by 0.1.0 replicas during the rolling
+    update (they write `last_seen_at` only). Its next reading stored by 0.2.0 sets `lastReadingAt`.
+    `idle` / `offline`: it forwards old readings, its clock is behind, or its newer readings went
+    through 0.1.0 replicas — compare `lastReadingAt` with `lastSeenAt`.
   - _A late import is missing from `1h`/`1d` buckets_: it is folded in by the next policy refresh
     (≤ 15 min / ≤ 1 h); each UTC day of a request was stored in its own transaction, so only the
     imported days are re-aggregated. Manual refresh:
@@ -524,9 +636,13 @@ described in [`docs/METHODOLOGY.md`](../../docs/METHODOLOGY.md) §7.1 and §20.2
 
 | Method id                                                                                   | Implemented by                                                                                                                                                                                                                   | Sources                                                                                                                                                                                                   |
 | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`fuel.method_selection`](../../docs/METHODOLOGY.md#fuel.method_selection) ⚠️               | `src/domain/telemetry-status.ts#isTelemetryActive` — the "active" rule `t_now − t_last ≤ W` (min)                                                                                                                                | legacy MVP (`be-legacy/src/repositories/ships/fuel-data.repository.ts#isActive`), [platform spec §13.4, §15.5](../../docs/PLATFORM_SPEC.md)                                                               |
+| [`fuel.method_selection`](../../docs/METHODOLOGY.md#fuel.method_selection) ⚠️               | `src/domain/telemetry-status.ts#isTelemetryActive` — the "active" rule `t_now − t_last ≤ W` (min); also the `online` limit of `src/modules/devices/device.ts#deviceConnectionState`                                              | legacy MVP (`be-legacy/src/repositories/ships/fuel-data.repository.ts#isActive`), [platform spec §13.4, §15.5](../../docs/PLATFORM_SPEC.md)                                                               |
 | [`telemetry.fuel_reading_usage`](../../docs/METHODOLOGY.md#telemetry.fuel_reading_usage) ⚠️ | `src/domain/fuel-aggregation.ts#addTotals`, `#totalFuelTon` — `FC_x = Σ r.fuel_x`, `FC = FC_ME + FC_AE` (t)                                                                                                                      | legacy MVP (`be-legacy/src/services/cii/cii.service.ts#calculateCII`, `src/models/ships/Telemetry.ts`), [platform spec §13.4](../../docs/PLATFORM_SPEC.md)                                                |
 | [`telemetry.reading_validation`](../../docs/METHODOLOGY.md#telemetry.reading_validation) ⚠️ | `src/domain/fuel-reading.ts#readingViolations` — plausibility rules (≥ 0, maxima, skew, age, period); `#batchViolations`, `#repeatViolations`, `#compareWithStored` — one reading per vessel and instant (duplicate vs conflict) | platform spec §13.4 (skew ≤ 5 min, batch ≤ 1000, idempotent by `(mmsi, time)`); the fuel maxima, the 24-h period, the 5-year age and the conflict rule are v2 design decisions without an external source |
+
+A device's `idle` / `offline` boundary (`TELEMETRY_DEVICE_OFFLINE_AFTER_MIN`, 24 h) is a v2 design
+value for the registry display, not a methodology value: it decides nothing computed (the emission
+service only uses the "active" rule).
 
 The meaning of one reading (tonnes per interval vs. a cumulative counter) is not specified by the
 legacy code and needs the device specification (catalog note of `telemetry.fuel_reading_usage`);

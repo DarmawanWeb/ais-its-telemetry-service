@@ -99,6 +99,7 @@ const device = (overrides: Partial<Device> = {}): Device => ({
   status: 'active',
   serialNumber: null,
   lastSeenAt: null,
+  lastReadingAt: null,
   createdBy: null,
   createdAt: NOW,
   updatedAt: NOW,
@@ -125,6 +126,11 @@ describe('ReadingsService', () => {
         duplicates: 0,
         conflicts: [],
         rejected: false,
+        latest: batch.readings.reduce<Date | null>(
+          (newest, input) =>
+            newest === null || input.time > newest ? input.time : newest,
+          null,
+        ),
       }),
     );
     publish.mockImplementation((readings) => Promise.resolve(readings.length));
@@ -212,12 +218,22 @@ describe('ReadingsService', () => {
 
     it('attributes readings of a device key to the device and marks it seen', async () => {
       deviceOfApiKey.mockResolvedValue(device());
-      await service.ingest([reading(525005223)], apiKey, undefined);
+      await service.ingest(
+        [reading(525005223, 5), reading(525005223, 15), reading(525005223)],
+        apiKey,
+        undefined,
+      );
       expect(store.mock.calls[0]?.[0]).toMatchObject({
         source: 'device',
         deviceId: device().id,
       });
-      expect(markSeen).toHaveBeenCalledWith(device().id, NOW);
+      // Received now; the newest reading the store holds for the device:
+      // 09:15, stored on its vessel (lastReadingAt only while it stays there).
+      expect(markSeen).toHaveBeenCalledWith(
+        expect.objectContaining({ id: device().id, mmsi: 525005223 }),
+        NOW,
+        reading(525005223, 15).time,
+      );
     });
 
     it('refuses keys of inactive devices and readings of other vessels', async () => {
@@ -302,6 +318,7 @@ describe('ReadingsService', () => {
         duplicates: 0,
         conflicts: [conflicting],
         rejected: true,
+        latest: null,
       });
 
       const error = await service

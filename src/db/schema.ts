@@ -31,7 +31,7 @@ export const vessels = serviceSchema.table(
   ],
 );
 
-/** Telemetry devices of an organization (`0001_init.sql`). */
+/** Telemetry devices of an organization (`0001_init.sql`, `0003_device_last_reading.sql`). */
 export const devices = serviceSchema.table(
   'devices',
   {
@@ -47,6 +47,8 @@ export const devices = serviceSchema.table(
       .default('active'),
     serialNumber: pg.text('serial_number'),
     lastSeenAt: timestamptz('last_seen_at'),
+    /** `0003_device_last_reading.sql`. */
+    lastReadingAt: timestamptz('last_reading_at'),
     createdBy: pg.uuid('created_by'),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
     updatedAt: timestamptz('updated_at').notNull().defaultNow(),

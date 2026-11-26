@@ -1,6 +1,7 @@
 import { EVENT_TYPES, subjects } from '@darmawanweb/ais-its-contracts/events';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { refreshAggregates } from './support/aggregates.js';
 import { readFuelEvents } from './support/fuel-events.js';
 import { metricValue } from './support/metrics.js';
 import {
@@ -464,9 +465,17 @@ describe('fuel readings over REST', () => {
         url: `/api/v2/telemetry/devices/${device.id}`,
         headers: admin,
       });
-      expect(
-        seen.json<{ lastSeenAt: string | null }>().lastSeenAt,
-      ).not.toBeNull();
+      const seenBody = seen.json<{
+        lastSeenAt: string | null;
+        lastReadingAt: string | null;
+        connectionState: string;
+      }>();
+      expect(seenBody.lastSeenAt).not.toBeNull();
+      // Received now, measured 11 minutes ago: beyond the 10-minute active window.
+      expect(seenBody).toMatchObject({
+        lastReadingAt: minutesAgo(11),
+        connectionState: 'idle',
+      });
 
       const mismatch = await post(
         { mmsi: vesselA2, time: minutesAgo(12), fuelMeTon: 1, fuelAeTon: 0 },
@@ -715,13 +724,11 @@ describe('fuel readings over REST', () => {
 
       // Readings three days old lie below the materialization watermark once
       // any refresh policy ran (other test files run them): they are folded in
-      // by the next refresh, as the policy jobs do.
-      await service.pool.query(
-        `CALL refresh_continuous_aggregate('fuel_hourly', NULL, NULL)`,
-      );
-      await service.pool.query(
-        `CALL refresh_continuous_aggregate('fuel_daily', NULL, NULL)`,
-      );
+      // by the next refresh, as the policy jobs do. The policies keep running
+      // meanwhile (a fuel_daily run may be in progress, e.g. the one of the
+      // job app.int.test.ts recreates): refreshAggregates pauses them and
+      // waits out a run in progress instead of failing on its 55P03.
+      await refreshAggregates(service.pool);
       expect(await series('1h')).toEqual(expectedHourly);
       expect(await series('1d')).toEqual(expectedDaily);
     });

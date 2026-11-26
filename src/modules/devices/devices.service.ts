@@ -1,7 +1,7 @@
 import type { PageQuery, Paginated } from '@darmawanweb/ais-its-contracts/api';
 import { toPaginated, pageOffset } from '@darmawanweb/ais-its-contracts/api';
 import { newId } from '@darmawanweb/ais-its-contracts/domain';
-import { ValidationFailedError } from '@darmawanweb/ais-its-nest';
+import { InjectConfig, ValidationFailedError } from '@darmawanweb/ais-its-nest';
 import {
   type AuditRequest,
   AuditService,
@@ -16,31 +16,44 @@ import {
   isUniqueViolation,
   PG_SQLSTATES,
 } from '@darmawanweb/ais-its-nest/db';
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 
+import { CLOCK, type Clock } from '../../common/clock.js';
 import {
   DeviceApiKeyTakenError,
   DeviceCredentialConflictError,
   DeviceNameTakenError,
   DeviceNotFoundError,
+  DeviceNotMqttError,
   VesselAccessDeniedError,
   VesselWithoutOrganizationError,
 } from '../../common/errors.js';
+import { type Config, DEV_MQTT_URL } from '../../config.js';
 import {
   tenantScopeOf,
   VesselAccessService,
 } from '../vessels/vessel-access.service.js';
 import {
+  type ConnectionThresholds,
   DEVICE_API_KEY_CONSTRAINT,
   DEVICE_CREDENTIAL_CONSTRAINT,
   DEVICE_NAME_CONSTRAINT,
+  deviceConnectionState,
   deviceCredentialError,
   type Device,
   type DeviceChanges,
   type DeviceFilter,
   type DeviceKind,
   type DeviceStatus,
+  type DeviceView,
+  type DeviceWithVessel,
 } from './device.js';
+import {
+  type MqttBroker,
+  mqttBrokerOf,
+  type MqttConnection,
+  mqttConnectionOf,
+} from './device-connection.js';
 import { DevicesRepository } from './devices.repository.js';
 
 /** Fields of a new device. */
@@ -56,23 +69,52 @@ export interface CreateDeviceInput {
 /**
  * Use cases of the device registry (`device:manage`): tenancy (a device
  * belongs to the organization of its vessel), the credential rule of its
- * kind, unique names and API keys per organization, and the audit trail.
- * Also serves the ingestion paths (device of an API key or an MQTT topic).
+ * kind, unique names and API keys per organization, the connection state and
+ * MQTT connection of a device, and the audit trail. Also serves the
+ * ingestion paths (device of an API key or an MQTT topic).
  */
 @Injectable()
-export class DevicesService {
+export class DevicesService implements OnModuleInit {
+  private readonly logger = new Logger(DevicesService.name);
+  private readonly thresholds: ConnectionThresholds;
+  private readonly broker: MqttBroker;
+
   constructor(
     private readonly repository: DevicesRepository,
     private readonly vessels: VesselAccessService,
     private readonly audit: AuditService,
-  ) {}
+    @InjectConfig() private readonly config: Config,
+    @Inject(CLOCK) private readonly clock: Clock,
+  ) {
+    this.thresholds = {
+      activeWindowMin: config.TELEMETRY_ACTIVE_WINDOW_MIN,
+      offlineAfterMin: config.TELEMETRY_DEVICE_OFFLINE_AFTER_MIN,
+    };
+    this.broker = mqttBrokerOf({
+      url: config.TELEMETRY_MQTT_URL,
+      authentication: config.TELEMETRY_MQTT_AUTH,
+      production: config.NODE_ENV === 'production',
+    });
+  }
+
+  /** Warns when production would describe the development broker to administrators. */
+  onModuleInit(): void {
+    if (
+      this.config.NODE_ENV === 'production' &&
+      this.config.TELEMETRY_MQTT_URL === DEV_MQTT_URL
+    ) {
+      this.logger.warn(
+        `TELEMETRY_MQTT_URL is the development default ${DEV_MQTT_URL}: GET /telemetry/devices/:id/connection describes it to administrators; set the broker URL devices reach (e.g. mqtts://mqtt.example.org:8883)`,
+      );
+    }
+  }
 
   /** Registers a device on a vessel the principal may access. */
   async create(
     input: CreateDeviceInput,
     principal: Principal,
     request?: AuditRequest,
-  ): Promise<Device> {
+  ): Promise<DeviceView> {
     const { orgId } = await this.vessels.accessibleOne(input.mmsi, principal);
     if (orgId === null) throw new VesselWithoutOrganizationError(input.mmsi);
     const apiKeyId = input.apiKeyId ?? null;
@@ -102,14 +144,12 @@ export class DevicesService {
       principal,
       request,
     );
-    return device;
+    return this.view(device);
   }
 
   /** A device visible to the principal, else `404 DEVICE_NOT_FOUND`. */
-  async get(id: string, principal: Principal): Promise<Device> {
-    const device = await this.repository.findById(id, tenantScopeOf(principal));
-    if (device === undefined) throw new DeviceNotFoundError(id);
-    return device;
+  async get(id: string, principal: Principal): Promise<DeviceView> {
+    return this.view(await this.find(id, principal));
   }
 
   /** One page of the devices visible to the principal. */
@@ -117,14 +157,34 @@ export class DevicesService {
     filter: DeviceFilter,
     page: PageQuery,
     principal: Principal,
-  ): Promise<Paginated<Device>> {
+  ): Promise<Paginated<DeviceView>> {
     if (filter.orgId !== undefined) assertOrgAccess(principal, filter.orgId);
     const { rows, total } = await this.repository.list(
       filter,
       tenantScopeOf(principal),
       { offset: pageOffset(page), limit: page.pageSize },
     );
-    return toPaginated(rows, page, total);
+    const now = this.clock.now();
+    return toPaginated(
+      rows.map((row) => this.view(row, now)),
+      page,
+      total,
+    );
+  }
+
+  /**
+   * How an `mqtt` device visible to the principal connects to the
+   * platform's broker (`TELEMETRY_MQTT_URL`, `TELEMETRY_MQTT_AUTH`) and
+   * publishes: topic, QoS and its broker user. No secret: the broker, not
+   * this service, authenticates devices.
+   *
+   * @throws {DeviceNotFoundError} `404` for devices the principal cannot see.
+   * @throws {DeviceNotMqttError} `409` for `http` devices.
+   */
+  async connection(id: string, principal: Principal): Promise<MqttConnection> {
+    const device = await this.find(id, principal);
+    if (device.kind !== 'mqtt') throw new DeviceNotMqttError(id);
+    return mqttConnectionOf(device, this.broker);
   }
 
   /**
@@ -160,7 +220,7 @@ export class DevicesService {
     changes: DeviceChanges,
     principal: Principal,
     request?: AuditRequest,
-  ): Promise<Device> {
+  ): Promise<DeviceView> {
     const current = await this.get(id, principal);
     const fields = Object.entries(changes)
       .filter(([, value]) => value !== undefined)
@@ -194,7 +254,7 @@ export class DevicesService {
       principal,
       request,
     );
-    return device;
+    return this.view(device);
   }
 
   /** Deletes a device; its readings keep their `deviceId` as history. */
@@ -230,9 +290,41 @@ export class DevicesService {
     return this.repository.findForIngest(id);
   }
 
-  /** Refreshes `lastSeenAt` after readings of the device were stored. */
-  async markSeen(id: string, at: Date): Promise<void> {
-    await this.repository.markSeen(id, at);
+  /**
+   * Refreshes `lastSeenAt` (receipt) and `lastReadingAt` (the measurement
+   * time of the newest reading of the batch now stored as the device's, new
+   * or a duplicate; `null` when every reading conflicted) after a batch of
+   * the device was stored on its vessel `device.mmsi`; `lastReadingAt` only
+   * while the device is still on that vessel.
+   */
+  async markSeen(
+    device: Pick<Device, 'id' | 'mmsi'>,
+    at: Date,
+    lastReadingAt: Date | null,
+  ): Promise<void> {
+    await this.repository.markSeen(device, at, lastReadingAt);
+  }
+
+  /** A device visible to the principal, else `404 DEVICE_NOT_FOUND`. */
+  private async find(
+    id: string,
+    principal: Principal,
+  ): Promise<DeviceWithVessel> {
+    const device = await this.repository.findById(id, tenantScopeOf(principal));
+    if (device === undefined) throw new DeviceNotFoundError(id);
+    return device;
+  }
+
+  /** The device with its connection state now and the thresholds of the state. */
+  private view(
+    device: DeviceWithVessel,
+    now: Date = this.clock.now(),
+  ): DeviceView {
+    return {
+      ...device,
+      ...this.thresholds,
+      connectionState: deviceConnectionState(device, now, this.thresholds),
+    };
   }
 
   /**

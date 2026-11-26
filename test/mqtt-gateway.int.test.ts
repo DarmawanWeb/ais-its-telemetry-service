@@ -29,6 +29,7 @@ describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
   const orgId = newOrgId();
   const [vessel] = uniqueMmsis(1) as [number];
   let deviceId: string;
+  let admin: { authorization: string };
 
   const started = (): TestService => {
     if (service === undefined) throw new Error('service not started');
@@ -39,9 +40,10 @@ describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
     const { mqttUrl } = testInfra('nats').nats;
     if (mqttUrl === undefined)
       throw new Error('the global setup started NATS without MQTT');
-    service = await startTestService();
+    // The broker devices reach, as GET /telemetry/devices/:id/connection describes it.
+    service = await startTestService({ env: { TELEMETRY_MQTT_URL: mqttUrl } });
     await service.publishVessel({ mmsi: vessel, orgId });
-    const admin = await service.authorization({ roles: ['org_admin'], orgId });
+    admin = await service.authorization({ roles: ['org_admin'], orgId });
     const created = await service.app.inject({
       method: 'POST',
       url: '/api/v2/telemetry/devices',
@@ -92,6 +94,90 @@ describe('fuel meters over MQTT (NATS MQTT gateway)', () => {
       fuelMeTon: 0.75,
       deviceId,
       source: 'mqtt',
+    });
+  });
+
+  it('accepts what a meter publishes with exactly the details of GET /devices/:id/connection', async () => {
+    const { app, pool } = started();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v2/telemetry/devices',
+      headers: admin,
+      payload: { mmsi: vessel, name: 'AE flow meter', kind: 'mqtt' },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const id = created.json<{ id: string }>().id;
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v2/telemetry/devices/${id}/connection`,
+      headers: admin,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const connection = response.json<{
+      brokerUrl: string;
+      host: string;
+      port: number;
+      tls: boolean;
+      protocolVersion: string;
+      topic: string;
+      qos: 0 | 1;
+      username: string | null;
+    }>();
+    expect(connection).toMatchObject({
+      brokerUrl: testInfra('nats').nats.mqttUrl,
+      tls: false,
+      protocolVersion: '3.1.1',
+      topic: telemetryMqttTopic(id),
+      qos: 1,
+      username: null,
+    });
+
+    const client = await connectAsync({
+      host: connection.host,
+      port: connection.port,
+      protocol: connection.tls ? 'mqtts' : 'mqtt',
+      // MQTT 3.1.1 is protocol level 4.
+      protocolVersion: connection.protocolVersion === '3.1.1' ? 4 : 5,
+      clientId: uniqueName('ae-meter'),
+      connectTimeout: 10_000,
+      reconnectPeriod: 0,
+    });
+    const time = new Date(Math.floor(Date.now() / 1000) * 1000 - 30_000);
+    try {
+      await client.publishAsync(
+        connection.topic,
+        JSON.stringify({
+          time: time.toISOString(),
+          fuelMeTon: 0,
+          fuelAeTon: 0.02,
+        }),
+        { qos: connection.qos },
+      );
+    } finally {
+      await client.endAsync();
+    }
+
+    await waitFor(
+      async () =>
+        (
+          await pool.query(
+            'SELECT 1 FROM fuel_readings WHERE mmsi = $1 AND time = $2 AND device_id = $3',
+            [vessel, time, id],
+          )
+        ).rowCount === 1,
+      {
+        timeoutMs: 15_000,
+        message: 'reading of the connection guide not stored',
+      },
+    );
+    const device = await app.inject({
+      method: 'GET',
+      url: `/api/v2/telemetry/devices/${id}`,
+      headers: admin,
+    });
+    expect(device.json()).toMatchObject({
+      lastReadingAt: time.toISOString(),
+      connectionState: 'online',
     });
   });
 

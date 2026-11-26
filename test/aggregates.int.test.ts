@@ -1,5 +1,15 @@
+import { setTimeout as sleep } from 'node:timers/promises';
+
+import { testInfra, waitFor } from '@darmawanweb/ais-its-nest/testing';
+import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import {
+  refreshAggregates,
+  refreshPolicyOf,
+  runRefreshPolicy,
+  scheduleRefreshPolicies,
+} from './support/aggregates.js';
 import {
   newOrgId,
   startTestService,
@@ -24,39 +34,6 @@ describe('hypertable and continuous aggregates', () => {
     number,
     number,
   ];
-
-  /** The id of the refresh policy job of a continuous aggregate. */
-  const refreshJobOf = async (view: 'fuel_hourly' | 'fuel_daily') => {
-    const { rows } = await service.pool.query<{ job_id: number }>(
-      // jobs names the aggregate itself (TimescaleDB 2.32) or, in older
-      // releases, its materialization hypertable.
-      `SELECT j.job_id FROM timescaledb_information.jobs j
-       JOIN timescaledb_information.continuous_aggregates c
-         ON c.view_schema = 'telemetry' AND c.view_name = $1
-       WHERE j.proc_name = 'policy_refresh_continuous_aggregate'
-         AND ((j.hypertable_schema = c.view_schema AND j.hypertable_name = c.view_name)
-           OR (j.hypertable_schema = c.materialization_hypertable_schema
-               AND j.hypertable_name = c.materialization_hypertable_name))`,
-      [view],
-    );
-    expect(rows).toHaveLength(1);
-    return rows[0]?.job_id;
-  };
-
-  /** Runs the refresh policy of a continuous aggregate now (as its schedule would). */
-  const runRefreshPolicy = async (view: 'fuel_hourly' | 'fuel_daily') => {
-    await service.pool.query('CALL run_job($1)', [await refreshJobOf(view)]);
-  };
-
-  /** Pauses or resumes the schedules of both refresh policies. */
-  const scheduleRefreshPolicies = async (scheduled: boolean) => {
-    for (const view of ['fuel_hourly', 'fuel_daily'] as const) {
-      await service.pool.query('SELECT alter_job($1, scheduled => $2)', [
-        await refreshJobOf(view),
-        scheduled,
-      ]);
-    }
-  };
 
   const post = (body: object, query = '') =>
     service.app.inject({
@@ -95,8 +72,8 @@ describe('hypertable and continuous aggregates', () => {
       fuelAeTon: 1,
     });
     expect(recent.json()).toMatchObject({ accepted: 1 });
-    await runRefreshPolicy('fuel_hourly');
-    await runRefreshPolicy('fuel_daily');
+    await runRefreshPolicy(service.pool, 'fuel_hourly');
+    await runRefreshPolicy(service.pool, 'fuel_daily');
 
     const day = Math.floor((Date.now() - 200 * DAY_MS) / DAY_MS) * DAY_MS;
     const at = (hours: number) => new Date(day + hours * HOUR_MS).toISOString();
@@ -110,8 +87,8 @@ describe('hypertable and continuous aggregates', () => {
     );
     expect(imported.json()).toMatchObject({ accepted: 3 });
 
-    await runRefreshPolicy('fuel_hourly');
-    await runRefreshPolicy('fuel_daily');
+    await runRefreshPolicy(service.pool, 'fuel_hourly');
+    await runRefreshPolicy(service.pool, 'fuel_daily');
 
     const range = `from=${at(0)}&to=${at(24)}`;
     const series = async (bucket: string) =>
@@ -179,8 +156,8 @@ describe('hypertable and continuous aggregates', () => {
 
     // Invalidations are logged below the materialization threshold (set by a
     // refresh); no policy run may consume the log before the check.
-    await runRefreshPolicy('fuel_hourly');
-    await scheduleRefreshPolicies(false);
+    await runRefreshPolicy(service.pool, 'fuel_hourly');
+    await scheduleRefreshPolicies(service.pool, false);
     try {
       const response = await post(
         [
@@ -207,7 +184,7 @@ describe('hypertable and continuous aggregates', () => {
         [last.toISOString(), last.toISOString()],
       ]);
     } finally {
-      await scheduleRefreshPolicies(true);
+      await scheduleRefreshPolicies(service.pool, true);
     }
   });
 
@@ -277,5 +254,67 @@ describe('hypertable and continuous aggregates', () => {
       { fuelMeTon: 5, source: 'import' },
       { fuelMeTon: 5, source: 'import' },
     ]);
+  });
+
+  it('refreshes both aggregates while a refresh of them is in progress, with the policies paused meanwhile', async () => {
+    // A policy run in progress, as TimescaleDB registers it: the window of
+    // fuel_daily held by a live backend (the admin connection). Overlapping
+    // refreshes are refused with 55P03 until it ends.
+    const admin = new Client({
+      connectionString: testInfra('postgres').postgres.adminUrl,
+    });
+    await admin.connect();
+    const daily = await refreshPolicyOf(service.pool, 'fuel_daily');
+    const hourly = await refreshPolicyOf(service.pool, 'fuel_hourly');
+    const endRun = () =>
+      admin.query(
+        `DELETE FROM _timescaledb_catalog.continuous_aggs_jobs_refresh_ranges
+         WHERE pid = pg_backend_pid()`,
+      );
+    try {
+      await admin.query(
+        `INSERT INTO _timescaledb_catalog.continuous_aggs_jobs_refresh_ranges
+           (materialization_id, start_range, end_range, pid, job_id, created_at)
+         SELECT mat_hypertable_id, -9223372036854775808, 9223372036854775807,
+                pg_backend_pid(), $1, now()
+         FROM _timescaledb_catalog.continuous_agg
+         WHERE user_view_schema = 'telemetry' AND user_view_name = 'fuel_daily'`,
+        [daily.jobId],
+      );
+      // What the plain CALL of readings.int.test.ts ran into.
+      await expect(
+        service.pool.query(
+          `CALL refresh_continuous_aggregate('fuel_daily', NULL, NULL)`,
+        ),
+      ).rejects.toMatchObject({ code: '55P03' });
+
+      // A paused schedule stays paused, a running one runs again afterwards.
+      await scheduleRefreshPolicies(service.pool, true);
+      await service.pool.query('SELECT alter_job($1, scheduled => false)', [
+        hourly.jobId,
+      ]);
+      const refreshedAt = refreshAggregates(service.pool).then(() =>
+        Date.now(),
+      );
+      await waitFor(
+        async () =>
+          !(await refreshPolicyOf(service.pool, 'fuel_daily')).scheduled,
+      );
+      // Refused meanwhile; the run ends a moment later and the refresh follows.
+      await sleep(300);
+      const endedAt = Date.now();
+      await endRun();
+      expect(await refreshedAt).toBeGreaterThanOrEqual(endedAt);
+      expect(
+        (await refreshPolicyOf(service.pool, 'fuel_daily')).scheduled,
+      ).toBe(true);
+      expect(
+        (await refreshPolicyOf(service.pool, 'fuel_hourly')).scheduled,
+      ).toBe(false);
+    } finally {
+      await endRun();
+      await admin.end();
+      await scheduleRefreshPolicies(service.pool, true);
+    }
   });
 });

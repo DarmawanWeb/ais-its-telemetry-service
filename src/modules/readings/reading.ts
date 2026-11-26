@@ -43,6 +43,13 @@ export interface StoreOutcome {
   readonly conflicts: readonly NewReading[];
   /** Policy `reject` found conflicts: the batch was refused. */
   readonly rejected: boolean;
+  /**
+   * Measurement time of the newest reading of the batch the store holds now
+   * with the batch's provenance (stored by it, or a duplicate); `null` when
+   * the batch was refused or every reading conflicted. A device's
+   * `lastReadingAt`.
+   */
+  readonly latest: Date | null;
 }
 
 /** What happened to a batch. */

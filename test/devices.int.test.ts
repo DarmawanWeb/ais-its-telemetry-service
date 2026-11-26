@@ -4,6 +4,7 @@ import { parseEnvelope, subjects } from '@darmawanweb/ais-its-contracts/events';
 import { NatsClient } from '@darmawanweb/ais-its-nest/nats';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { DevicesRepository } from '../src/modules/devices/devices.repository.js';
 import {
   newOrgId,
   startTestService,
@@ -17,6 +18,7 @@ interface DeviceBody {
   readonly id: string;
   readonly orgId: string;
   readonly mmsi: number;
+  readonly vesselName: string | null;
   readonly name: string;
   readonly kind: 'mqtt' | 'http';
   readonly apiKeyId: string | null;
@@ -24,6 +26,11 @@ interface DeviceBody {
   readonly serialNumber: string | null;
   readonly mqttTopic: string | null;
   readonly lastSeenAt: string | null;
+  readonly lastReadingAt: string | null;
+  readonly connectionState:
+    'online' | 'idle' | 'offline' | 'never' | 'inactive';
+  readonly activeWindowMin: number;
+  readonly offlineAfterMin: number;
   readonly createdBy: string | null;
 }
 
@@ -101,8 +108,13 @@ describe('device registry /telemetry/devices (device:manage)', () => {
       serialNumber: 'FM-2041-0007',
       mqttTopic: `aisits/telemetry/${meter.id}`,
       lastSeenAt: null,
+      lastReadingAt: null,
+      connectionState: 'never',
+      activeWindowMin: 10,
+      offlineAfterMin: 1440,
       createdBy: adminAId,
     });
+    expect(meter.vesselName).toEqual(expect.any(String));
 
     const key = service.apiKey(orgA);
     const gateway = await create({
@@ -117,6 +129,7 @@ describe('device registry /telemetry/devices (device:manage)', () => {
       apiKeyId: key.keyId,
       status: 'inactive',
       mqttTopic: null,
+      connectionState: 'inactive',
     });
   });
 
@@ -400,6 +413,262 @@ describe('device registry /telemetry/devices (device:manage)', () => {
     expect(
       (await request('GET', '', service.apiKey(orgA).headers)).statusCode,
     ).toBe(401);
+  });
+
+  it('shows the vessel name, the newest reading and the connection state of every device', async () => {
+    const [vessel, other] = uniqueMmsis(2) as [number, number];
+    const snapshot = await service.publishVessel({
+      mmsi: vessel,
+      orgId: orgA,
+      name: 'KM Sinar Bahari',
+    });
+    await service.publishVessel({ mmsi: other, orgId: orgA, name: 'KM Lain' });
+    const now = Math.floor(Date.now() / 1000) * 1000;
+    const minutesAgo = (minutes: number) =>
+      new Date(now - minutes * 60_000).toISOString();
+
+    // http devices report through their keys: newest readings 1 min, 1 h and 2 days old.
+    const reporting = async (name: string, ages: readonly number[]) => {
+      const key = service.apiKey(orgA);
+      const device = await create({
+        mmsi: vessel,
+        name,
+        kind: 'http',
+        apiKeyId: key.keyId,
+      });
+      const posted = await service.app.inject({
+        method: 'POST',
+        url: '/api/v2/telemetry/readings',
+        headers: key.headers,
+        payload: ages.map((age) => ({
+          mmsi: vessel,
+          time: minutesAgo(age),
+          fuelMeTon: 0.1,
+          fuelAeTon: 0.01,
+        })),
+      });
+      expect(posted.statusCode, posted.body).toBe(202);
+      return device;
+    };
+    const online = await reporting('Online gateway', [31, 1]);
+    const idle = await reporting('Idle gateway', [60]);
+    const offline = await reporting('Offline gateway', [2 * 1440]);
+    const silent = await create({
+      mmsi: vessel,
+      name: 'New meter',
+      kind: 'mqtt',
+    });
+    const off = await create({
+      mmsi: vessel,
+      name: 'Spare meter',
+      kind: 'mqtt',
+      status: 'inactive',
+    });
+    expect(silent).toMatchObject({
+      vesselName: 'KM Sinar Bahari',
+      connectionState: 'never',
+    });
+
+    const response = await request('GET', `?mmsi=${vessel}`, adminA);
+    expect(response.statusCode, response.body).toBe(200);
+    const byName = new Map(
+      response
+        .json<DevicePageBody>()
+        .data.map((device) => [device.name, device] as const),
+    );
+    expect(byName.get(online.name)).toMatchObject({
+      vesselName: 'KM Sinar Bahari',
+      // The newest of the batch, whatever its order in the request.
+      lastReadingAt: minutesAgo(1),
+      connectionState: 'online',
+      activeWindowMin: 10,
+      offlineAfterMin: 1440,
+    });
+    expect(byName.get(online.name)?.lastSeenAt).not.toBeNull();
+    expect(byName.get(idle.name)).toMatchObject({
+      lastReadingAt: minutesAgo(60),
+      connectionState: 'idle',
+    });
+    expect(byName.get(offline.name)).toMatchObject({
+      lastReadingAt: minutesAgo(2 * 1440),
+      connectionState: 'offline',
+    });
+    expect(byName.get(silent.name)).toMatchObject({
+      lastSeenAt: null,
+      lastReadingAt: null,
+      connectionState: 'never',
+    });
+    expect(byName.get(off.name)?.connectionState).toBe('inactive');
+
+    // Moving a device names its new vessel; a deleted vessel has no name.
+    const moved = await request('PATCH', `/${silent.id}`, adminA, {
+      mmsi: other,
+    });
+    expect(moved.json()).toMatchObject({ mmsi: other, vesselName: 'KM Lain' });
+    await service.deleteVessel(snapshot);
+    const orphaned = await request('GET', `/${online.id}`, adminA);
+    expect(orphaned.json()).toMatchObject({
+      mmsi: vessel,
+      vesselName: null,
+      connectionState: 'online',
+    });
+  });
+
+  it('counts the readings of the current vessel only: a move makes a reporting device never until it reports there', async () => {
+    const [from, to] = uniqueMmsis(2) as [number, number];
+    await service.publishVessel({ mmsi: from, orgId: orgA, name: 'KM Asal' });
+    await service.publishVessel({ mmsi: to, orgId: orgA, name: 'KM Tujuan' });
+    const now = Math.floor(Date.now() / 1000) * 1000;
+    const minutesAgo = (minutes: number) =>
+      new Date(now - minutes * 60_000).toISOString();
+    const key = service.apiKey(orgA);
+    const device = await create({
+      mmsi: from,
+      name: 'Moving gateway',
+      kind: 'http',
+      apiKeyId: key.keyId,
+    });
+    const report = async (mmsi: number, age: number) => {
+      const posted = await service.app.inject({
+        method: 'POST',
+        url: '/api/v2/telemetry/readings',
+        headers: key.headers,
+        payload: [
+          { mmsi, time: minutesAgo(age), fuelMeTon: 0.1, fuelAeTon: 0.01 },
+        ],
+      });
+      expect(posted.statusCode, posted.body).toBe(202);
+    };
+    const vesselStatus = async (mmsi: number) => {
+      const response = await service.app.inject({
+        method: 'GET',
+        url: `/api/v2/telemetry/vessels/${mmsi}/status`,
+        headers: adminA,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json<{ active: boolean; lastReadingAt: string | null }>();
+    };
+    const get = async () =>
+      (await request('GET', `/${device.id}`, adminA)).json<DeviceBody>();
+
+    await report(from, 1);
+    const reporting = await get();
+    expect(reporting).toMatchObject({
+      lastReadingAt: minutesAgo(1),
+      connectionState: 'online',
+    });
+    expect(reporting.lastSeenAt).not.toBeNull();
+
+    // A change that keeps the vessel keeps the newest reading.
+    const renamed = await request('PATCH', `/${device.id}`, adminA, {
+      mmsi: from,
+      name: 'Moved gateway',
+    });
+    expect(renamed.json()).toMatchObject({
+      lastReadingAt: minutesAgo(1),
+      connectionState: 'online',
+    });
+
+    // The move clears it in the same statement: the readings stay on the
+    // previous vessel, the new one has no telemetry, and an online device
+    // always means active telemetry of its vessel.
+    const moved = await request('PATCH', `/${device.id}`, adminA, { mmsi: to });
+    expect(moved.statusCode, moved.body).toBe(200);
+    expect(moved.json()).toMatchObject({
+      mmsi: to,
+      vesselName: 'KM Tujuan',
+      lastSeenAt: reporting.lastSeenAt,
+      lastReadingAt: null,
+      connectionState: 'never',
+    });
+    expect(await vesselStatus(to)).toMatchObject({
+      active: false,
+      lastReadingAt: null,
+    });
+    expect(await vesselStatus(from)).toMatchObject({ active: true });
+
+    // A batch received before the move but marked after it (its readings are
+    // on the previous vessel) refreshes the receipt only.
+    const seenAt = new Date(now + 5 * 60_000);
+    await service.app
+      .get(DevicesRepository)
+      .markSeen({ id: device.id, mmsi: from }, seenAt, new Date(now));
+    expect(await get()).toMatchObject({
+      lastSeenAt: seenAt.toISOString(),
+      lastReadingAt: null,
+      connectionState: 'never',
+    });
+
+    // Its first reading on the new vessel counts.
+    await report(to, 2);
+    expect(await get()).toMatchObject({
+      mmsi: to,
+      lastReadingAt: minutesAgo(2),
+      connectionState: 'online',
+    });
+    expect(await vesselStatus(to)).toMatchObject({
+      active: true,
+      lastReadingAt: minutesAgo(2),
+    });
+  });
+
+  it('describes the MQTT connection of an mqtt device, never a secret', async () => {
+    const meter = await create({
+      mmsi: vesselA1,
+      name: 'Connection meter',
+      kind: 'mqtt',
+    });
+    const connection = await request('GET', `/${meter.id}/connection`, adminA);
+    expect(connection.statusCode, connection.body).toBe(200);
+    // The development broker of the test configuration (TELEMETRY_MQTT_URL default).
+    expect(connection.json()).toEqual({
+      deviceId: meter.id,
+      brokerUrl: 'mqtt://localhost:1883',
+      host: 'localhost',
+      port: 1883,
+      tls: false,
+      protocolVersion: '3.1.1',
+      topic: `aisits/telemetry/${meter.id}`,
+      qos: 1,
+      authentication: 'none',
+      username: null,
+    });
+    expect(
+      (await request('GET', `/${meter.id}/connection`, superAdmin)).statusCode,
+    ).toBe(200);
+
+    const gateway = await create({
+      mmsi: vesselA1,
+      name: 'Connection gateway',
+      kind: 'http',
+      apiKeyId: service.apiKey(orgA).keyId,
+    });
+    const http = await request('GET', `/${gateway.id}/connection`, adminA);
+    expect(http.statusCode).toBe(409);
+    expect(http.json()).toMatchObject({
+      code: 'DEVICE_NOT_MQTT',
+      deviceId: gateway.id,
+    });
+
+    const foreign = await request('GET', `/${meter.id}/connection`, adminB);
+    expect(foreign.statusCode).toBe(404);
+    expect(foreign.json()).toMatchObject({ code: 'DEVICE_NOT_FOUND' });
+    expect(
+      (await request('GET', `/${randomUUID()}/connection`, adminA)).statusCode,
+    ).toBe(404);
+    const malformed = await request('GET', '/meter-7/connection', adminA);
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.json()).toMatchObject({
+      code: 'VALIDATION_FAILED',
+      errors: [expect.objectContaining({ field: 'id', code: 'isUuid' })],
+    });
+    const manager = await service.authorization({
+      roles: ['fleet_manager'],
+      orgId: orgA,
+    });
+    expect(
+      (await request('GET', `/${meter.id}/connection`, manager)).statusCode,
+    ).toBe(403);
   });
 
   it('lists the devices of a vessel read-only for telemetry:read, without credentials', async () => {

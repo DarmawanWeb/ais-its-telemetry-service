@@ -92,6 +92,8 @@ describe('ReadingIngestService', () => {
       accepted: 4,
       duplicates: 0,
       conflicts: 0,
+      // The newest measurement of the batch, whatever its order.
+      latest: new Date('2026-11-21T09:00:00Z'),
       published: 4,
     });
     expect(publishCommitted).toHaveBeenCalledOnce();
@@ -128,8 +130,50 @@ describe('ReadingIngestService', () => {
     );
 
     expect(outcome).toMatchObject({ accepted: 1, conflicts: 1, published: 1 });
+    // The conflicting reading is another device's: not the newest of this one.
+    expect(outcome.latest).toEqual(kept.time);
     expect(findStored).not.toHaveBeenCalled();
     expect(await counted('conflict')).toBe(1);
+  });
+
+  it('counts duplicates of the device in latest, and none when everything conflicted', async () => {
+    const [resent, fresh] = [
+      reading('2026-11-21T09:00:00Z'),
+      reading('2026-11-21T08:00:00Z'),
+    ] as const;
+    store.mockImplementation((window) =>
+      Promise.resolve({
+        stored: window
+          .filter((r) => r.time.getTime() === fresh.time.getTime())
+          .map(asStored),
+        duplicates: window.filter(
+          (r) => r.time.getTime() === resent.time.getTime(),
+        ),
+        conflicts: [],
+        rejected: false,
+      }),
+    );
+    const outcome = await service.ingest(
+      { readings: [resent, fresh], source: 'mqtt', deviceId: DEVICE },
+      'skip',
+    );
+    expect(outcome).toMatchObject({ accepted: 1, duplicates: 1 });
+    expect(outcome.latest).toEqual(resent.time);
+
+    store.mockImplementation((window) =>
+      Promise.resolve({
+        stored: [],
+        duplicates: [],
+        conflicts: [...window],
+        rejected: false,
+      }),
+    );
+    const conflicted = await service.ingest(
+      { readings: [resent, fresh], source: 'mqtt', deviceId: DEVICE },
+      'skip',
+    );
+    expect(conflicted).toMatchObject({ accepted: 0, conflicts: 2 });
+    expect(conflicted.latest).toBeNull();
   });
 
   it('reject: compares a multi-day batch first and stores nothing on a conflict', async () => {
@@ -143,7 +187,7 @@ describe('ReadingIngestService', () => {
       'reject',
     );
 
-    expect(outcome).toMatchObject({ rejected: true, stored: [] });
+    expect(outcome).toMatchObject({ rejected: true, stored: [], latest: null });
     expect(outcome.conflicts.map((r) => r.time)).toEqual([taken.time]);
     expect(store).not.toHaveBeenCalled();
     expect(await counted('conflict')).toBe(1);
@@ -196,5 +240,6 @@ describe('ReadingIngestService', () => {
     expect(store).toHaveBeenCalledTimes(2);
     expect(outcome.rejected).toBe(true);
     expect(outcome.stored).toHaveLength(1);
+    expect(outcome.latest).toBeNull();
   });
 });

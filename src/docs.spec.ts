@@ -64,14 +64,19 @@ describe('rolling update from 0.1.0', () => {
   // forbids unknown properties: every request with `order` (asc included) is a
   // 400 there, and the routes added in 0.2.0 are a 404. A newest-first cursor
   // never reaches a 0.1.0 replica "as ascending": 0.2.0 itself refuses it
-  // without `order=desc`.
+  // without `order=desc`. Migration 0003 is recorded but has no file on 0.1.0
+  // (its migrator only warns), and 0.1.0 does not write `last_reading_at`.
   const facts = [
     '`order=asc` included',
     '`400 VALIDATION_FAILED`',
     "field: 'order'",
     'readings.csv',
     '/vessels/:mmsi/devices',
+    '/devices/:id/connection',
     '`404 NOT_FOUND`',
+    '0003',
+    'recorded migration has no file',
+    '`lastReadingAt`',
     'only once every telemetry replica runs 0.2.0',
   ];
 
@@ -133,6 +138,29 @@ describe('README Troubleshooting', () => {
     expect(csv.endsWith('retry, or narrow the range.')).toBe(true);
     expect(flat(item(entries, '- _Startup warnings_'))).not.toContain(
       'TELEMETRY_PUBLISH_TIMEOUT_MS',
+    );
+  });
+
+  it('names every cause of a device that stays never while it delivers', () => {
+    const entries = listItems(
+      item(operations(), '- **Troubleshooting**'),
+      '  ',
+    );
+    const never = flat(item(entries, '- _A device stays `never`'));
+    // `lastReadingAt` counts the readings of the device's current vessel:
+    // conflicts, a move (also one before 0003, whose backfill reads the
+    // current vessel only) and readings stored by 0.1.0 replicas (they write
+    // `last_seen_at` only) all leave it null while `lastSeenAt` is set.
+    for (const cause of [
+      'conflicted with readings of another producer',
+      'moved to another vessel since its last reading',
+      'a move before migration `0003`',
+      'stored by 0.1.0 replicas',
+    ]) {
+      expect(never).toContain(cause);
+    }
+    expect(flat(section(README, '## API'))).toContain(
+      'moving the device to another vessel (`PATCH` `mmsi`) clears it in the same statement, so the device is `never` until its first reading there',
     );
   });
 });

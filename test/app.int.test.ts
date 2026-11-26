@@ -1,8 +1,15 @@
+import { randomUUID } from 'node:crypto';
+
 import { runMigrations } from '@darmawanweb/ais-its-nest/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { MIGRATIONS_DIR, SERVICE } from '../src/service.js';
-import { startTestService, type TestService } from './support/test-service.js';
+import {
+  newOrgId,
+  startTestService,
+  type TestService,
+  uniqueMmsis,
+} from './support/test-service.js';
 
 const METHODOLOGY_URL = `/api/v2/${SERVICE.name}/methodology`;
 
@@ -39,7 +46,11 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
     const { rows } = await service.pool.query<{ name: string }>(
       'SELECT name FROM schema_migrations ORDER BY version',
     );
-    expect(rows.map((row) => row.name)).toEqual(['init', 'fuel_aggregates']);
+    expect(rows.map((row) => row.name)).toEqual([
+      'init',
+      'fuel_aggregates',
+      'device_last_reading',
+    ]);
 
     const hypertables = await service.pool.query<{
       hypertable_name: string;
@@ -104,8 +115,11 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
     const policiesBefore = await policies();
 
     // A first deployment that died after the fuel_hourly statements: its
-    // view and policies exist, fuel_daily does not, 0002 is not recorded.
-    await service.pool.query('DELETE FROM schema_migrations WHERE version = 2');
+    // view and policies exist, fuel_daily does not, 0002 is not recorded
+    // (nor 0003, which never ran: the migrator applies versions in order).
+    await service.pool.query(
+      'DELETE FROM schema_migrations WHERE version IN (2, 3)',
+    );
     await service.pool.query('DROP MATERIALIZED VIEW fuel_daily');
 
     const report = await runMigrations({
@@ -114,7 +128,9 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
       dir: MIGRATIONS_DIR,
     });
 
-    expect(report.applied.map((migration) => migration.version)).toEqual([2]);
+    expect(report.applied.map((migration) => migration.version)).toEqual([
+      2, 3,
+    ]);
     expect(await recorded()).toEqual(before);
     // fuel_daily and its policy are back, nothing was created twice.
     expect(await policies()).toEqual(policiesBefore);
@@ -130,6 +146,81 @@ describe(`${SERVICE.packageName} platform behaviour`, () => {
       { proc_name: 'policy_retention', target: 'fuel_hourly' },
       { proc_name: 'policy_retention', target: 'fuel_readings' },
     ]);
+  });
+
+  it('backfills lastReadingAt (0003) from the stored readings, and converges when retried', async () => {
+    const { pool } = service;
+    const [vessel, previous] = uniqueMmsis(2) as [number, number];
+    const orgId = newOrgId();
+    const ids = {
+      reporting: randomUUID(),
+      sharing: randomUUID(),
+      silent: randomUUID(),
+      moved: randomUUID(),
+    };
+    const at = (minutesAgo: number) =>
+      new Date(Math.floor(Date.now() / 60_000) * 60_000 - minutesAgo * 60_000);
+    // Devices as 0.1.0 left them: last_seen_at only. `sharing` reports on
+    // the same vessel, its newest reading is behind newer ones of `reporting`;
+    // `silent` never delivered; `moved` reported on its previous vessel.
+    await pool.query(
+      `INSERT INTO devices (id, org_id, mmsi, name, kind, last_seen_at) VALUES
+         ($1, $5, $6, 'Reporting', 'mqtt', now()),
+         ($2, $5, $6, 'Sharing', 'mqtt', now()),
+         ($3, $5, $6, 'Silent', 'mqtt', NULL),
+         ($4, $5, $6, 'Moved', 'mqtt', now())`,
+      [ids.reporting, ids.sharing, ids.silent, ids.moved, orgId, vessel],
+    );
+    const readings: [Date, number, string][] = [
+      [at(40), vessel, ids.reporting],
+      [at(30), vessel, ids.sharing],
+      [at(20), vessel, ids.reporting],
+      [at(10), vessel, ids.reporting],
+      [at(5), previous, ids.moved],
+    ];
+    for (const [time, mmsi, deviceId] of readings) {
+      await pool.query(
+        `INSERT INTO fuel_readings (time, mmsi, device_id, fuel_me_ton, fuel_ae_ton, source)
+         VALUES ($1, $2, $3, 1, 0.1, 'mqtt')`,
+        [time, mmsi, deviceId],
+      );
+    }
+    const lastReadings = async () =>
+      Object.fromEntries(
+        (
+          await pool.query<{ name: string; last_reading_at: Date | null }>(
+            'SELECT name, last_reading_at FROM devices WHERE org_id = $1',
+            [orgId],
+          )
+        ).rows.map((row) => [row.name, row.last_reading_at]),
+      );
+    const migrate = async () => {
+      // A run that died after the ALTER TABLE: 0003 is not recorded.
+      await pool.query('DELETE FROM schema_migrations WHERE version = 3');
+      const report = await runMigrations({
+        pool,
+        schema: SERVICE.schema,
+        dir: MIGRATIONS_DIR,
+      });
+      expect(report.applied.map((migration) => migration.version)).toEqual([3]);
+    };
+
+    await migrate();
+    expect(await lastReadings()).toEqual({
+      Reporting: at(10),
+      Sharing: at(30),
+      Silent: null,
+      // Gets it with its next reading.
+      Moved: null,
+    });
+
+    // Retried: rows that have a value keep it.
+    await pool.query('UPDATE devices SET last_reading_at = $2 WHERE id = $1', [
+      ids.reporting,
+      at(1),
+    ]);
+    await migrate();
+    expect((await lastReadings()).Reporting).toEqual(at(1));
   });
 
   it('denies anonymous requests with 401 problem details', async () => {

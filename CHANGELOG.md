@@ -11,12 +11,16 @@ All notable changes to `ais-its-telemetry-service` are documented in this file. 
 Upgrade to `@darmawanweb/ais-its-contracts` 0.4.0 and `@darmawanweb/ais-its-nest` 0.3.0: the
 local workarounds for the platform issues this service reported are gone (stream re-creation,
 MQTT test infrastructure, the widened fleet envelope), template helpers replace local ones, and
-the backend gaps the web app reported are closed. No migration; 0.1.0 and 0.2.0 replicas can run
-side by side during a rolling update (same tables, subjects, queue group and durable), but only
-0.2.0 answers the new API: a 0.1.0 replica answers every request with `order` (`order=asc`
-included) with `400 VALIDATION_FAILED` (`field: 'order'`), and `readings.csv` and
-`/vessels/:mmsi/devices` with `404 NOT_FOUND`. Switch the web app to `order=desc`, the CSV export
-and the devices list only once every telemetry replica runs 0.2.0.
+the backend gaps the web app reported are closed. One migration, `0003_device_last_reading` (a
+nullable column, backfilled with row locks only; 0.1.0 replicas tolerate it and log that a recorded
+migration has no file); 0.1.0 and 0.2.0 replicas can run side by side during a rolling update (same
+tables, subjects, queue group and durable; readings a 0.1.0 replica stores do not advance a device's
+`lastReadingAt` until its next reading on 0.2.0), but only 0.2.0 answers the new API: a 0.1.0
+replica answers every request with `order` (`order=asc` included) with `400 VALIDATION_FAILED`
+(`field: 'order'`), `readings.csv`, `/vessels/:mmsi/devices` and `/devices/:id/connection` with
+`404 NOT_FOUND`, and devices without `vesselName`, `lastReadingAt` and `connectionState`. Switch the
+web app to `order=desc`, the CSV export, the devices list, the device connection state and the
+connection guide only once every telemetry replica runs 0.2.0.
 
 ### Added
 
@@ -37,14 +41,57 @@ and the devices list only once every telemetry replica runs 0.2.0.
   vessel's organization registered on it, by name, read-only (`id`, `name`, `kind`, `status`,
   `lastSeenAt`; no API key, serial number, MQTT topic or creator), so fleet managers see which
   meters report without `device:manage`; the same devices `GET /telemetry/vessels` counts.
+- Devices of `GET /api/v2/telemetry/devices` (and `GET …/:id`, the `POST`/`PATCH` responses) carry
+  `vesselName` (FLEET projection, joined by primary key, so names no longer depend on the web app
+  joining `GET /vessels` page by page; `null` while the MMSI is not a live vessel), `lastReadingAt`
+  (measurement time of the newest reading stored as the device's on its current vessel: new or an
+  exact repeat, never a refused conflict; a move to another vessel clears it, so an online device
+  always means active telemetry of its vessel) and `connectionState` — `inactive` (switched off),
+  `never` (no reading on its current vessel yet), `online` (newest reading at most
+  `activeWindowMin` old: the vessel telemetry "active" rule, `fuel.method_selection`), `idle` (up
+  to `offlineAfterMin`), `offline` — with both thresholds in every item (`activeWindowMin` =
+  `TELEMETRY_ACTIVE_WINDOW_MIN`, `offlineAfterMin` = the new `TELEMETRY_DEVICE_OFFLINE_AFTER_MIN`,
+  default 1440 = 24 h, at least the active window), replacing the web app's fixed client thresholds
+  (15 min / 24 h on `lastSeenAt`).
+- `devices.last_reading_at` (migration `0003_device_last_reading`, no-transaction and idempotent:
+  `ADD COLUMN IF NOT EXISTS`, backfill of rows still `NULL` from each device's newest reading on its
+  current vessel, read backwards on the `(mmsi, time)` primary key). Both ingestion paths write it
+  with `last_seen_at` in one statement, when either advances by more than a minute (about once a
+  minute for a device reporting in real time), never backwards (`GREATEST`), and only while the
+  device is still on the vessel the batch was stored on; `PATCH /devices/:id` with another `mmsi`
+  clears it in the same statement as the move (`last_seen_at` is kept).
+- `GET /api/v2/telemetry/devices/:id/connection` (`device:manage`, tenant-private like the device):
+  how an `mqtt` device connects and publishes — `brokerUrl`, `host`, `port`, `tls` from the new
+  `TELEMETRY_MQTT_URL` (`mqtt://host[:port]` default port 1883, `mqtts://` TLS default 8883; no
+  credentials, path or port 0 accepted, the host ASCII — an internationalized name in punycode, as
+  `mqtt:` URLs get no IDNA processing; default `mqtt://localhost:1883`, the development broker, with
+  a startup warning in production), `protocolVersion` `3.1.1` (the NATS MQTT gateway), the device's
+  `topic`, `qos` 1, and `authentication` / `username` from the new `TELEMETRY_MQTT_AUTH` (`none`:
+  any client, `username` `null`; `password`, the production default: the device's own broker user,
+  named by its id). `http` devices answer `409 DEVICE_NOT_MQTT`. No password is issued, stored or
+  returned (requested with the connection details, not implemented): the broker authenticates MQTT
+  clients against its own users, not against this service, so a password generated here would not be
+  checked (the development broker accepts any client); making the service the authenticator (a NATS
+  auth callout) would put it in the broker's connect path with the account signing key — a platform
+  decision (spec §3, §7.3, `infra/nats`) — and machine credentials are the auth service's domain
+  (spec §8.1, §13.1). The platform operator provisions each device's broker user and password
+  (README, _MQTT connection of a device_).
 - Methodology: `telemetry.reading_validation` (catalogued in contracts 0.4.0) tagged on
   `readingViolations`, `batchViolations`, `repeatViolations` and `compareWithStored` and listed in
   `IMPLEMENTED_METHOD_IDS`, so `GET /telemetry/methodology` describes all three methods.
 - Integration tests: a `FUEL` stream deleted at runtime is re-created by the next publish; readings
   stay queued while a sealed `FUEL` stream rejects them and are relayed once it is replaced; the MQTT
-  round trip on the kit's MQTT-enabled test NATS; newest-first pages; the CSV export (values,
-  buckets, empty range, headers, CORS, problem details); the devices of a vessel (tenancy,
-  permissions, no credentials); path parameter errors; the catalogued methodology.
+  round trip on the kit's MQTT-enabled test NATS, also with exactly the details of
+  `GET /devices/:id/connection`; newest-first pages; the CSV export (values, buckets, empty range,
+  headers, CORS, problem details); the devices of a vessel (tenancy, permissions, no credentials);
+  vessel names, `lastReadingAt` on both ingestion paths and every `connectionState`, a reporting
+  device moved to another vessel (`never` there; a batch of its previous vessel in flight refreshes
+  only `lastSeenAt`); the connection endpoint (`409`, `404`, `403`, `400`); the `0003` backfill
+  retried without overwriting values; path parameter errors; the catalogued methodology; the manual
+  aggregate refresh of the tests (`test/support/aggregates.ts`) pauses the refresh policies and
+  waits out a run in progress (kit `refreshContinuousAggregate`) instead of failing with `55P03`
+  ("due to a concurrent refresh", a policy run overlapping it), against a refresh window registered
+  in the TimescaleDB catalog.
 
 ### Changed
 
@@ -65,6 +112,10 @@ and the devices list only once every telemetry replica runs 0.2.0.
   without a restart; before, every publish failed with "no responders" until the service restarted.
 - The service's own logs of database errors (publisher, relay, CSV export) are sanitized with the
   kit's `sanitizeError` (no bound values); the kit sanitizes problem details and its own logs.
+- The ingestion pipeline reports the measurement time of the newest reading it holds for a batch
+  (`latest`; duplicates count, conflicts do not), which `markSeen` writes as `lastReadingAt`.
+- `DeviceDto.lastSeenAt` is documented as the receipt time (it always was); `lastReadingAt` is the
+  measurement time.
 - Kit 0.3 behaviour: a startup warning when the NATS `max_payload` is below 4 MiB and in production
   while `TRUSTED_PROXIES` is the default (`.env.example` documents both); tracing exports traces
   only; CORS exposes `ETag` and `Location`; database errors in problem details carry the driver's
